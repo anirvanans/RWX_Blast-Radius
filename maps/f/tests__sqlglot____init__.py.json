@@ -1,0 +1,1 @@
+{"ast":"affac6d25c2de3cb699f8ef9b19331ebe82bf17d","funcs":[],"stmts":[[1,1,"module",true,["os"]],[3,5,"module",true,["_integration_dir"]],[6,7,"module",false,[]],[7,7,"module",false,[]]],"family":false,"file":"0","imp":"0","dial":"0","strings":[],"module":"tests.sqlglot"}
