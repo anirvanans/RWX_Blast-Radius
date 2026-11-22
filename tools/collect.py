@@ -66,6 +66,7 @@ cov.start()
 state = {"ctx": "boot"}
 opened = {}  # ctx -> set(paths)
 dialects = {}  # ctx -> set(modules)
+types_used = {}  # ctx -> set(classes instantiated or looked up)
 imported = {}  # ctx -> set(modules)
 FIX = os.path.join(ROOT, "tests", "fixtures") + os.sep
 
@@ -199,11 +200,71 @@ def hook_dialects():
 
     Dialect.__init__ = init
 
+    # which classes each test instantiates (with their bases): expressions,
+    # dialects, tokenizers, parsers, generators
+    from sqlglot import tokens, parser, generator
+    from sqlglot.expressions.core import Expr
+
+    def wrap_init(klass):
+        orig = klass.__init__
+
+        def __init__(self, *a, **k):
+            s = types_used.get(state["ctx"])
+            if s is None:
+                s = types_used[state["ctx"]] = set()
+            s.add(type(self))
+            return orig(self, *a, **k)
+
+        klass.__init__ = __init__
+
+    for klass in (Expr, tokens.Tokenizer, parser.Parser, generator.Generator):
+        wrap_init(klass)
+    orig_dinit = Dialect.__init__
+
+    def dinit(self, *a, **k):
+        types_used.setdefault(state["ctx"], set()).add(type(self))
+        return orig_dinit(self, *a, **k)
+
+    Dialect.__init__ = dinit
+
 
 set_ctx("boot")
 rc = pytest.main(["-q", "-p", "no:cacheprovider", "-p", "no:randomly", *FILES], plugins=[Plugin()])
 cov.stop()
 cov.save()
+
+def class_keys(types):
+    keys = set()
+    for t in types:
+        try:
+            mro = list(t.__mro__)
+            for name in dir(t):
+                if name.startswith("__"):
+                    continue
+                try:
+                    v = getattr(t, name)
+                except Exception:
+                    continue
+                if isinstance(v, type) and t.__module__.startswith("sqlglot.dialects"):
+                    mro += list(v.__mro__)
+        except Exception:
+            continue
+        for c in mro:
+            m = getattr(c, "__module__", "") or ""
+            if m.startswith("sqlglot"):
+                keys.add(m + ":" + c.__qualname__)
+    return keys
+
+
+key_cache = {}
+classes = {}
+for ctx, ts in types_used.items():
+    ks = set()
+    for t in ts:
+        if t not in key_cache:
+            key_cache[t] = class_keys([t])
+        ks |= key_cache[t]
+    classes[ctx] = sorted(ks)
 with _open(OUT + ".json", "w") as f:
     json.dump(
         {
@@ -211,6 +272,7 @@ with _open(OUT + ".json", "w") as f:
             "opened": {k: sorted(v) for k, v in opened.items()},
             "dialects": {k: sorted(v) for k, v in dialects.items()},
             "imported": {k: sorted(v) for k, v in imported.items()},
+            "classes": classes,
         },
         f,
     )

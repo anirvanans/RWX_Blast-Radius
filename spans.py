@@ -89,14 +89,15 @@ def bound_names(st):
 
 
 def statements(tree):
-    """[(start, end, scope, safe, names)] for statements outside functions.
+    """[(start, end, scope, safe, names, owner)] for statements outside functions.
 
     scope is "module" or "class". A ClassDef is listed in the scope that holds
-    it; the statements of its body are listed with scope "class".
+    it, with itself as owner; the statements of its body are listed with
+    scope "class" and the class as owner.
     """
     out = []
 
-    def visit(body, scope):
+    def visit(body, scope, owner):
         for st in body:
             start = st.lineno
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -104,18 +105,21 @@ def statements(tree):
             safe = isinstance(st, SAFE_STMTS) or (
                 isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
             )
-            out.append((start, st.end_lineno, scope, safe, bound_names(st)))
             if isinstance(st, ast.ClassDef):
-                visit(st.body, "class")
-            elif isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                q = (owner + "." if owner else "") + st.name
+                out.append((start, st.end_lineno, scope, safe, bound_names(st), q))
+                visit(st.body, "class", q)
+                continue
+            out.append((start, st.end_lineno, scope, safe, bound_names(st), owner))
+            if isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
                 inner = []
                 for f in ("body", "orelse", "finalbody"):
                     inner += getattr(st, f, []) or []
                 for h in getattr(st, "handlers", []) or []:
                     inner += h.body
-                visit(inner, scope)
+                visit(inner, scope, owner)
 
-    visit(tree.body, "module")
+    visit(tree.body, "module", None)
     return out
 
 
@@ -142,3 +146,47 @@ def in_ranges(ranges, line):
         if s <= line <= e:
             return True
     return False
+
+
+COMPOUND = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
+if hasattr(ast, "TryStar"):
+    COMPOUND = COMPOUND + (ast.TryStar,)
+
+
+def inner_statements(tree):
+    """[(start, header_end)] for statements inside function bodies.
+
+    A compound statement stands for its header only (the test of an if, the
+    iterator of a for); its body statements are listed on their own.
+    """
+    out = []
+
+    def visit(body):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(st, COMPOUND) or (hasattr(ast, "Match") and isinstance(st, ast.Match)):
+                first = None
+                for f in ("body", "cases"):
+                    b = getattr(st, f, None)
+                    if b:
+                        first = b[0]
+                        break
+                he = (first.lineno - 1) if first is not None else st.end_lineno
+                out.append((st.lineno, max(st.lineno, he)))
+                visit(getattr(st, "body", []) or [])
+                visit(getattr(st, "orelse", []) or [])
+                visit(getattr(st, "finalbody", []) or [])
+                for h in getattr(st, "handlers", []) or []:
+                    hb = h.body[0].lineno - 1 if h.body else h.end_lineno
+                    out.append((h.lineno, max(h.lineno, hb)))
+                    visit(h.body)
+                for c in getattr(st, "cases", []) or []:
+                    visit(c.body)
+            else:
+                out.append((st.lineno, st.end_lineno))
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit(n.body)
+    return out

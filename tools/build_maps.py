@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import zlib
 from collections import defaultdict
 
 import coverage
@@ -66,6 +67,17 @@ def module_name(path):
     return path[:-3].replace("/", ".").removesuffix(".__init__")
 
 
+def exec_lines(src, p):
+    from coverage.python import PythonParser
+
+    try:
+        pp = PythonParser(text=src, filename=p)
+        pp.parse_source()
+        return set(pp.statements)
+    except Exception:
+        return set()
+
+
 files = py_files()
 info = {}
 for p in files:
@@ -79,6 +91,8 @@ for p in files:
         "nlines": src.count("\n") + 1,
         "ast": hashlib.sha1(ast.dump(tree).encode()).hexdigest(),
         "strings": S.string_ranges(tree),
+        "istmts": S.inner_statements(tree),
+        "exec": exec_lines(src, p),
     }
 
 
@@ -95,11 +109,13 @@ def innermost_index(p):
 
 
 inner = {p: innermost_index(p) for p in files}
+line_bits = {p: defaultdict(int) for p in files}
 func_bits = {p: [0] * len(info[p]["spans"]) for p in files}
 file_bits = defaultdict(int)  # any line executed during a test phase
 imp_bits = defaultdict(int)  # module imported during a test (or its file's collection)
 dial_bits = defaultdict(int)  # dialect classes from this module used by a test
 fix_bits = defaultdict(int)
+cls_bits = defaultdict(int)  # "module:Qual.Name" -> tests that used that class or a subclass
 
 for prefix in PREFIXES:
     data = coverage.CoverageData(prefix + ".coverage")
@@ -122,10 +138,12 @@ for prefix in PREFIXES:
                     file_bits[p] |= bits
                     if fi >= 0:
                         func_bits[p][fi] |= bits
+                        line_bits[p][ln] |= bits
                 elif kind == "collect" and fi >= 0 and not info[p]["spans"][fi][3]:
                     # function bodies run while a test file is imported:
                     # if they break, the whole file fails to import
                     func_bits[p][fi] |= bits
+                    line_bits[p][ln] |= bits
     rec = json.load(open(prefix + ".json"))
     for ctx, mods in rec["dialects"].items():
         bits, kind = ctx_tests(ctx)
@@ -137,6 +155,12 @@ for prefix in PREFIXES:
             path = m.replace(".", "/")
             path = path + "/__init__.py" if os.path.isdir(os.path.join(ROOT, path)) else path + ".py"
             imp_bits[path] |= bits
+    for ctx, keys in rec.get("classes", {}).items():
+        bits, kind = ctx_tests(ctx)
+        if kind != "test":
+            continue
+        for k in keys:
+            cls_bits[k] |= bits
     for ctx, paths in rec["opened"].items():
         bits, kind = ctx_tests(ctx)
         for q in paths:
@@ -295,6 +319,48 @@ for p in files:
 
     scan(info[p]["tree"].body)
 
+META_FUNCS = {"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "__prepare__"}
+
+
+def loads_in(node, skip_functions):
+    out = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if skip_functions and n is not node and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+            out.add(n.attr)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+            out.add(n.value)
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+unsafe = set()
+for p in files:
+    if not p.startswith("sqlglot/"):
+        continue
+    tree = info[p]["tree"]
+    # read while modules and classes are being built
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in st.decorator_list + st.args.defaults:
+                unsafe |= loads_in(d, True)
+            continue
+        unsafe |= loads_in(st, True)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef):
+            meta = any(isinstance(b, ast.Name) and b.id == "type" for b in n.bases)
+            for st in n.body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if meta or st.name in META_FUNCS:
+                        unsafe |= loads_in(st, False)
+                elif not isinstance(st, ast.ClassDef):
+                    unsafe |= loads_in(st, True)
+
 name_bits = defaultdict(int)
 for p in files:
     for i, (s, e, q, is_lambda, node) in enumerate(info[p]["spans"]):
@@ -317,6 +383,23 @@ def hx(b):
     return format(b, "x")
 
 
+def istmts_of(p):
+    """[start, header_end, bitset or None]; None when coverage cannot see the statement."""
+    out = []
+    ex = info[p]["exec"]
+    lb = line_bits[p]
+    for s_, he in info[p]["istmts"]:
+        lines = range(s_, he + 1)
+        if not any(ln in ex for ln in lines):
+            out.append([s_, he, None])
+            continue
+        b = 0
+        for ln in lines:
+            b |= lb.get(ln, 0)
+        out.append([s_, he, hx(b)])
+    return out
+
+
 os.makedirs(os.path.join(OUT, "f"), exist_ok=True)
 index = {}
 for p in files:
@@ -325,16 +408,37 @@ for p in files:
         "ast": info[p]["ast"],
         "funcs": [[s, e, q, hx(func_bits[p][i])] for i, (s, e, q, _, _) in enumerate(sp)],
         "stmts": [list(x) for x in info[p]["stmts"]],
+        "istmts": istmts_of(p),
         "family": is_family(p),
+        "cls": {k.split(":", 1)[1]: hx(b) for k, b in cls_bits.items() if k.split(":", 1)[0] == module_name(p)},
         "file": hx(file_bits.get(p, 0)),
         "imp": hx(imp_bits.get(p, 0)),
         "dial": hx(dial_bits.get(p, 0)),
         "strings": info[p]["strings"],
         "module": module_name(p),
     }
+    # one table of distinct bitsets per file; everything else refers to it
+    table, pos = [], {}
+
+    def ref(h):
+        if h is None:
+            return None
+        if h not in pos:
+            pos[h] = len(table)
+            table.append(h)
+        return pos[h]
+
+    for f in entry["funcs"]:
+        f[3] = ref(f[3])
+    for st in entry["istmts"]:
+        st[2] = ref(st[2])
+    for k in ("file", "imp", "dial"):
+        entry[k] = ref(entry[k])
+    entry["cls"] = {q: ref(h) for q, h in entry["cls"].items()}
+    entry["B"] = table
     key = p.replace("/", "__")
-    with open(os.path.join(OUT, "f", key + ".json"), "w") as f:
-        json.dump(entry, f, separators=(",", ":"))
+    with open(os.path.join(OUT, "f", key + ".z"), "wb") as f:
+        f.write(zlib.compress(json.dumps(entry, separators=(",", ":")).encode(), 9))
     index[p] = key
 
 fix_dirs = defaultdict(int)
@@ -358,6 +462,6 @@ with open(os.path.join(OUT, "index.json"), "w") as f:
         f,
         separators=(",", ":"),
     )
-with open(os.path.join(OUT, "names.json"), "w") as f:
-    json.dump({k: hx(v) for k, v in name_bits.items()}, f, separators=(",", ":"))
+with open(os.path.join(OUT, "names.z"), "wb") as f:
+    f.write(zlib.compress(json.dumps({"bits": {k: hx(v) for k, v in name_bits.items()}, "unsafe": sorted(unsafe & set(name_bits))}, separators=(",", ":")).encode(), 9))
 print("files", len(files), "names", len(name_bits), "fixtures opened", len(fix_bits), file=sys.stderr)

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -20,7 +21,7 @@ MAPS = os.path.join(HERE, "maps")
 SRC = os.path.join(HERE, "src")  # pristine sqlglot sources (.py only)
 
 ALL = "ALL"
-IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+CONST = re.compile(r"^(?:[A-Z][A-Z0-9_]*|arg_types)$")
 
 # Paths that cannot change what a test sees.
 INERT_PREFIXES = ("docs/", "posts/", "benchmarks/", ".github/", "sqlglotrs/", "pdoc/", "sqlglot-integration-tests/")
@@ -49,15 +50,25 @@ class Maps:
             if key is None:
                 self._files[path] = None
             else:
-                with open(os.path.join(MAPS, "f", key + ".json")) as f:
-                    e = json.load(f)
+                with open(os.path.join(MAPS, "f", key + ".z"), "rb") as f:
+                    e = json.loads(zlib.decompress(f.read()))
+                B = e.pop("B")
+                for fn in e["funcs"]:
+                    fn[3] = B[fn[3]]
+                for st in e["istmts"]:
+                    st[2] = None if st[2] is None else B[st[2]]
+                for k in ("file", "imp", "dial"):
+                    e[k] = B[e[k]]
+                e["cls"] = {q: B[i] for q, i in e["cls"].items()}
                 self._files[path] = e
         return self._files[path]
 
     def names(self):
         if self._names is None:
-            with open(os.path.join(MAPS, "names.json")) as f:
-                self._names = json.load(f)
+            with open(os.path.join(MAPS, "names.z"), "rb") as f:
+                d = json.loads(zlib.decompress(f.read()))
+            self._names = d["bits"]
+            self._unsafe = set(d["unsafe"])
         return self._names
 
 
@@ -150,7 +161,7 @@ def apply_hunks(old_text, hunks):
         old = old[:-1]
     out = []
     pos = 0  # index into old (0-based)
-    deleted, added = [], []
+    deleted, added, pairs = [], [], {}
     new_no_nl = False
     for os_, ol, ns, nl, body in hunks:
         start = os_ - 1 if ol > 0 else os_
@@ -159,16 +170,30 @@ def apply_hunks(old_text, hunks):
         out.extend(old[pos:start])
         pos = start
         last = None
+        run_del, run_add = [], []
+
+        def flush():
+            if run_del and len(run_del) == len(run_add):
+                for a, b in zip(run_del, run_add):
+                    pairs[b] = a
+            run_del.clear()
+            run_add.clear()
+
         for kind, txt in body:
             if kind == " ":
+                flush()
                 out.append(old[pos] if pos < len(old) else txt)
                 pos += 1
             elif kind == "-":
+                if run_add:
+                    flush()
                 deleted.append(pos + 1)
+                run_del.append(pos + 1)
                 pos += 1
             elif kind == "+":
                 out.append(txt)
                 added.append(len(out))
+                run_add.append(len(out))
             elif kind == "\\":
                 if last == "+":
                     new_no_nl = True
@@ -176,11 +201,12 @@ def apply_hunks(old_text, hunks):
                     new_no_nl = True
             if kind != "\\":
                 last = kind
+        flush()
     out.extend(old[pos:])
     text = "\n".join(out)
     if not new_no_nl:
         text += "\n"
-    return text, deleted, added
+    return text, deleted, added, pairs
 
 
 def load_src(path):
@@ -232,7 +258,7 @@ class Selector:
         old_text = load_src(path)
         if old_text is None:
             return ALL
-        new_text, deleted, added = apply_hunks(old_text, d["hunks"])
+        new_text, deleted, added, pairs = apply_hunks(old_text, d["hunks"])
         try:
             tree = ast.parse(new_text)
         except SyntaxError:
@@ -253,10 +279,10 @@ class Selector:
                 continue
             i = S.innermost(funcs, ln)
             if i >= 0:
-                bits |= int(funcs[i][3], 16)
+                bits |= self.in_function(entry, i, ln)
             else:
                 j = S.innermost(stmts, ln)
-                scopes.append(tuple(stmts[j][2:5]) if j >= 0 else ("module", False, []))
+                scopes.append(tuple(stmts[j][2:6]) if j >= 0 else ("module", False, [], None))
         if added:
             nsp = S.function_spans(tree)
             nst = None
@@ -269,7 +295,13 @@ class Selector:
                     continue
                 i = S.innermost(nsp, ln)
                 if i >= 0 and nsp[i][2] in by_q:
-                    bits |= int(funcs[by_q[nsp[i][2]]][3], 16)
+                    fi = by_q[nsp[i][2]]
+                    o = pairs.get(ln)
+                    if o is not None and S.innermost(funcs, o) == fi:
+                        # a line replaced in place: what runs it is what ran the old line
+                        bits |= self.in_function(entry, fi, o)
+                    else:
+                        bits |= int(funcs[fi][3], 16)
                     continue
                 if nst is None:
                     nst = S.statements(tree)
@@ -279,21 +311,64 @@ class Selector:
                     j = S.innermost(nst, nsp[i][0])
                 else:
                     j = S.innermost(nst, ln)
-                scopes.append(tuple(nst[j][2:5]) if j >= 0 else ("module", False, []))
+                scopes.append(tuple(nst[j][2:6]) if j >= 0 else ("module", False, [], None))
         if scopes:
-            bits |= int(entry["file"], 16) | int(entry["dial"], 16)
-            if is_test or any(not safe for _, safe, _ in scopes):
-                bits |= int(entry["imp"], 16)
-            if not entry.get("family"):
-                names = m.names()
-                for scope, safe, nms in scopes:
-                    if scope != "module":
-                        continue
-                    for nm in nms:
-                        h = names.get(nm)
-                        if h:
-                            bits |= int(h, 16)
+            bits |= self.scope_tests(entry, scopes, is_test)
         return bits
+
+    def scope_tests(self, entry, scopes, is_test):
+        """Tests for changes at class or module level."""
+        m = self.maps
+        dial = int(entry["dial"], 16)
+        bits = 0
+        broad = False
+        for scope, safe, nms, owner in scopes:
+            if not safe:
+                bits |= int(entry["imp"], 16)
+            use = 0
+            q = owner
+            while q and not use:  # the class itself, else the class holding it
+                h = entry["cls"].get(q)
+                use = int(h, 16) if h else 0
+                q = q.rsplit(".", 1)[0] if "." in q else None
+            if scope == "class" and use and not is_test:
+                base = use | dial
+                names = m.names()
+                parts = 0
+                for nm in nms:
+                    h = names.get(nm)
+                    if h and nm not in m._unsafe and CONST.match(nm):
+                        parts |= base & int(h, 16)
+                    else:
+                        parts = base
+                        break
+                bits |= parts if nms else base
+                continue
+            broad = True
+            bits |= use
+            if scope == "module" and not entry.get("family"):
+                names = m.names()
+                for nm in nms:
+                    h = names.get(nm)
+                    if h:
+                        bits |= int(h, 16)
+        if broad:
+            bits |= int(entry["file"], 16) | dial
+            if is_test:
+                bits |= int(entry["imp"], 16)
+        return bits
+
+    @staticmethod
+    def in_function(entry, fi, ln):
+        """Tests for an old line inside function fi: its statement if visible, else the function."""
+        ist = entry["istmts"]
+        j = S.innermost(ist, ln)
+        if j >= 0:
+            s_, he, h = ist[j]
+            f = entry["funcs"][fi]
+            if h is not None and f[0] <= s_ and he <= f[1]:
+                return int(h, 16)
+        return int(entry["funcs"][fi][3], 16)
 
     def referenced(self, base, mod):
         """Does any pristine source mention this new module?"""
