@@ -364,7 +364,8 @@ lit_keys = {}
 for p in files:
     for a, b, q, at, ents, dyn in info[p]["dicts"]:
         lit_keys[module_name(p) + ":" + q + "|" + at] = sorted({e[0] for e in ents})
-safe_attrs = sorted({o.split("|")[1] for o in dk_wrapped} - dk_bad)
+# TRANSFORMS: the metaclass only pops given keys, and the dispatch copy is tracked
+safe_attrs = sorted({o.split("|")[1] for o in dk_wrapped} - (dk_bad - {"TRANSFORMS"}))
 rd = defaultdict(dict)
 table, tpos = [], {}
 for (owner, key), b in dk_readers.items():

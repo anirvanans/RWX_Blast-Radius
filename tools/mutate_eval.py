@@ -118,7 +118,36 @@ def other_kind():
     return p, new_t, as_patch(p, src, new_t)
 
 
+def transforms_kind():
+    p = rng.choice([f for f in files if f.startswith("sqlglot/generators/") or f == "sqlglot/generator.py"])
+    lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")
+    idx = [i for i, l in enumerate(lines) if re.match(r"\s+exp\.\w+: ", l)]
+    if not idx:
+        return None
+    i = rng.choice(idx)
+    nl = lines[:]
+    if re.search(r'"[A-Za-z_]+"', nl[i]) and rng.random() < 0.6:
+        nl[i] = re.sub(r'"([A-Za-z_]+)"', r'"\1X"', nl[i], count=1)
+    else:
+        m = re.match(r"(\s+exp\.)(\w+)(: .*)", nl[i])
+        others = [re.match(r"\s+exp\.(\w+): ", l).group(1) for l in lines if re.match(r"\s+exp\.\w+: ", l)]
+        nl[i] = m.group(1) + rng.choice(others) + m.group(3) if rng.random() < 0.5 else ""
+    old_t, new_t = "\n".join(lines), "\n".join(nl)
+    if old_t == new_t:
+        return None
+    try:
+        compile(new_t, p, "exec")
+    except SyntaxError:
+        return None
+    return p, new_t, as_patch(p, old_t, new_t)
+
+
 def mutate():
+    if os.environ.get("TRANSFORMS"):
+        while True:
+            r = transforms_kind()
+            if r:
+                return r
     if os.environ.get("MIX"):
         while True:
             r = other_kind()

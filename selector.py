@@ -339,6 +339,12 @@ class Selector:
                 continue
             if i >= 0:
                 bits |= self.unit(self.in_function(entry, i, ln))
+                if "<lambda" in funcs[i][2] and funcs[i][0] == ln:
+                    # the line that opens a lambda also holds what it is bound to
+                    # (a dict key, an argument): treat it as a change there too
+                    j = S.innermost(stmts, ln)
+                    if j >= 0 and not self.inside_function_stmt(funcs, i):
+                        scopes.append(tuple(stmts[j][2:6]))
             else:
                 j = S.innermost(stmts, ln)
                 scopes.append(tuple(stmts[j][2:6]) if j >= 0 else ("module", False, [], None))
@@ -380,6 +386,14 @@ class Selector:
                         bits |= self.unit(int(funcs[by_q[nsp[i][2]]][3], 16))
                     continue
                 i = S.innermost(nsp, ln)
+                if i >= 0 and nsp[i][3] and nsp[i][0] == ln and not any(
+                    sp[0] <= nsp[i][0] and nsp[i][1] <= sp[1] and not sp[3] for sp in nsp
+                ):
+                    if nst is None:
+                        nst = S.statements(tree)
+                    j = S.innermost(nst, ln)
+                    if j >= 0:
+                        scopes.append(tuple(nst[j][2:6]))
                 if i >= 0 and nsp[i][2] in by_q:
                     fi = by_q[nsp[i][2]]
                     o = pairs.get(ln)
@@ -438,6 +452,12 @@ class Selector:
             return False
         stripped = S.strip_docstrings(tree)
         return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
+
+    @staticmethod
+    def inside_function_stmt(funcs, i):
+        """Is lambda i inside a def (so its opening line is code in that def)?"""
+        s_, e_ = funcs[i][0], funcs[i][1]
+        return any(f[0] <= s_ and e_ <= f[1] and "<lambda" not in f[2] and f is not funcs[i] for f in funcs)
 
     def dict_key_tests(self, path, lits, ln):
         """Tests for a changed entry of a tracked class dict, or None to fall back."""

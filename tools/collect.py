@@ -335,6 +335,22 @@ def wrap_dicts():
             if isinstance(v, type) and v.__module__ == name:
                 visit(v)
 
+    # the generator's dispatch table is a cached copy of TRANSFORMS: track its
+    # lookups as lookups of TRANSFORMS (of the class whose dict was copied)
+    from sqlglot import generator as _gen
+
+    orig_build = _gen._build_dispatch
+
+    def build_dispatch(cls):
+        d = orig_build(cls)
+        owner_cls = next((c for c in cls.__mro__ if "TRANSFORMS" in vars(c)), cls)
+        td = TrackDict(d)
+        td._o = _ckey(owner_cls) + "|TRANSFORMS"
+        return td
+
+    _gen._build_dispatch = build_dispatch
+    _gen._DISPATCH_CACHE.clear()
+
 
 def hook_dialects():
     from sqlglot.dialects.dialect import Dialect
