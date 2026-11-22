@@ -212,3 +212,61 @@ def strip_docstrings(tree):
     for owner, d in docstrings(tree):
         owner.body = owner.body[1:] or [ast.Pass()]
     return tree
+
+
+def key_repr(node):
+    """How a dict key written in source reads at run time (see collect.py _kr)."""
+    if isinstance(node, ast.Constant):
+        v = node.value
+        return "s:" + v if isinstance(v, str) else "r:" + repr(v)
+    parts = []
+    n = node
+    while isinstance(n, ast.Attribute):
+        parts.append(n.attr)
+        n = n.value
+    if isinstance(n, ast.Name):
+        parts.append(n.id)
+    else:
+        return None
+    parts.reverse()
+    last = parts[-1]
+    if len(parts) >= 2 and parts[-2][:1].isupper() and last.isupper():
+        return "e:%s.%s" % (parts[-2], last)
+    if last[:1].isupper() and not last.isupper():
+        return "c:" + last
+    return None
+
+
+def dict_literals(tree):
+    """[(start, end, class qualname, attr, [(key, kstart, kend)], dynamic)] for
+    upper-case dict attributes written as dict displays in class bodies."""
+    out = []
+
+    def visit(body, prefix):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                visit(st.body, prefix + st.name + ".")
+                continue
+            if not prefix:
+                continue
+            if isinstance(st, ast.Assign) and len(st.targets) == 1:
+                tgt, val = st.targets[0], st.value
+            elif isinstance(st, ast.AnnAssign) and st.value is not None:
+                tgt, val = st.target, st.value
+            else:
+                continue
+            if not (isinstance(tgt, ast.Name) and tgt.id.isupper() and isinstance(val, ast.Dict)):
+                continue
+            entries, dynamic = [], False
+            for k, v in zip(val.keys, val.values):
+                if k is None:
+                    continue  # **base: copied entries belong to the base's literal
+                r = key_repr(k)
+                if r is None:
+                    dynamic = True
+                    continue
+                entries.append((r, k.lineno, v.end_lineno))
+            out.append((st.lineno, st.end_lineno, prefix[:-1], tgt.id, entries, dynamic))
+
+    visit(tree.body, "")
+    return out

@@ -72,6 +72,19 @@ class Maps:
                 self._files[path] = e
         return self._files[path]
 
+    def dicts(self):
+        if not hasattr(self, "_dicts"):
+            try:
+                with open(os.path.join(MAPS, "dicts.z"), "rb") as f:
+                    d = json.loads(zlib.decompress(f.read()))
+                d["safe_set"] = set(d["safe"])
+                d["wrapped_set"] = set(d["wrapped"])
+                d["lit"] = {k: set(v) for k, v in d["lit"].items()}
+                self._dicts = d
+            except Exception:  # noqa: BLE001
+                self._dicts = None
+        return self._dicts
+
     def names(self):
         if self._names is None:
             with open(os.path.join(MAPS, "names.z"), "rb") as f:
@@ -317,21 +330,54 @@ class Selector:
             txt = old_lines[ln - 1] if 0 < ln <= len(old_lines) else ""
             if trivial(txt) and not S.in_ranges(old_strings, ln):
                 continue
+            dk = self.dict_key_tests(path, entry.get("dicts") or [], ln)
             i = S.innermost(funcs, ln)
+            if dk is not None:
+                bits |= self.unit(dk)
+                if i >= 0:
+                    bits |= self.unit(self.in_function(entry, i, ln))
+                continue
             if i >= 0:
                 bits |= self.unit(self.in_function(entry, i, ln))
             else:
                 j = S.innermost(stmts, ln)
                 scopes.append(tuple(stmts[j][2:6]) if j >= 0 else ("module", False, [], None))
+        nst = None
+        ndl = None
+        # functions removed or renamed: their callers by name break
+        dset = set(deleted)
+        removed = [f for f in funcs if f[0] in dset or (f[0] <= min(dset or [0]) and False)]
+        if removed:
+            alive = {sp[2] for sp in S.function_spans(tree)}
+            for f in removed:
+                if "<lambda" in f[2] or f[2] in alive:
+                    continue
+                q = f[2]
+                if "." in q:
+                    owner, name = q.rsplit(".", 1)
+                    if "<locals>" in owner:
+                        continue
+                    scopes.append(("class", True, [name], owner))
+                else:
+                    scopes.append(("module", True, [q], None))
         if added:
             nsp = S.function_spans(tree)
-            nst = None
             nstr = S.string_ranges(tree)
             by_q = {f[2]: i for i, f in enumerate(funcs)}
             new_lines = new_text.split("\n")
             for ln in added:
                 txt = new_lines[ln - 1] if ln - 1 < len(new_lines) else ""
                 if trivial(txt) and not S.in_ranges(nstr, ln):
+                    continue
+                if ndl is None:
+                    ndl = S.dict_literals(tree)
+                dk = self.dict_key_tests(path, ndl, ln)
+                if dk is not None:
+                    bits |= self.unit(dk)
+                    i = S.innermost(nsp, ln)
+                    if i >= 0 and nsp[i][3] and nsp[i][2] in by_q:
+                        # a lambda value that existed before: what ran it
+                        bits |= self.unit(int(funcs[by_q[nsp[i][2]]][3], 16))
                     continue
                 i = S.innermost(nsp, ln)
                 if i >= 0 and nsp[i][2] in by_q:
@@ -357,6 +403,20 @@ class Selector:
             self.sub_all = True
         if scopes:
             bits |= self.unit(self.scope_tests(entry, scopes, is_test))
+            # a module-level name that is gone breaks every "from x import name"
+            gone = {nm for sc, _, nms, _ in scopes if sc == "module" for nm in nms}
+            if gone:
+                if nst is None:
+                    nst = S.statements(tree)
+                now = {nm for st in nst if st[2] == "module" for nm in st[4]}
+                if gone - now:
+                    bits |= self.unit(int(entry["imp"], 16))
+            if is_test and path.endswith("__init__.py"):
+                # every test module under this package imports it
+                pkg = os.path.dirname(path) + "/"
+                for tf, h in m.index["testfile"].items():
+                    if tf.startswith(pkg):
+                        bits |= int(h, 16)
         return bits
 
     @staticmethod
@@ -378,6 +438,48 @@ class Selector:
             return False
         stripped = S.strip_docstrings(tree)
         return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
+
+    def dict_key_tests(self, path, lits, ln):
+        """Tests for a changed entry of a tracked class dict, or None to fall back."""
+        if os.environ.get("BR_DICTKEYS", "1") != "1" or not path.startswith("sqlglot/"):
+            return None
+        hit = None
+        for lit in lits:
+            if lit[0] <= ln <= lit[1]:
+                hit = lit
+        if hit is None:
+            return None
+        _, _, q, attr, ents, _ = hit
+        key = None
+        for k, ks, ke in ents:
+            if ks <= ln <= ke:
+                key = k
+        if key is None:
+            return None
+        d = self.maps.dicts()
+        if d is None or attr not in d["safe_set"]:
+            return None
+        mod = path[:-3].replace("/", ".").removesuffix(".__init__")
+        ck = mod + ":" + q
+        if ck + "|" + attr not in d["wrapped_set"]:
+            return None
+        targets = set(d["subs"].get(ck, [ck])) | set(d["copiers"].get(attr, []))
+        B = d["B"]
+        bits = 0
+        for D in targets:
+            o = D + "|" + attr
+            if D != ck and key in d["lit"].get(o, ()):
+                continue  # this class writes its own entry for the key
+            if attr not in d["own"].get(D, ()):
+                continue  # no dict of its own: reads go to a base's dict
+            if o not in d["wrapped_set"]:
+                return None
+            r = d["readers"].get(o, {})
+            if key in r:
+                bits |= int(B[r[key]], 16)
+            if "*" in r:
+                bits |= int(B[r["*"]], 16)
+        return bits
 
     def scope_tests(self, entry, scopes, is_test):
         """Tests for changes at class or module level."""

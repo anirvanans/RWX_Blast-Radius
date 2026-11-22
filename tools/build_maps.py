@@ -95,6 +95,7 @@ for p in files:
         "docs": S.doc_ranges(tree),
         "astnd": hashlib.sha1(ast.dump(S.strip_docstrings(ast.parse(src))).encode()).hexdigest(),
         "istmts": S.inner_statements(tree),
+        "dicts": S.dict_literals(tree),
         "exec": exec_lines(src, p),
     }
 
@@ -253,6 +254,137 @@ for prefix in PREFIXES:
     rec = json.load(open(prefix + ".json"))
     for t, d in rec.get("unit_cpu", {}).items():
         unit_cpu_all[t] = d
+
+# ---- dict key readers -------------------------------------------------------
+dk_readers = defaultdict(int)  # (owner, key) -> tests
+dk_wrapped, dk_own, dk_mro = set(), {}, {}
+for prefix in PREFIXES:
+    rec = json.load(open(prefix + ".json"))
+    if "dict_keys" not in rec:
+        continue
+    dk_wrapped |= set(rec["dict_wrapped"])
+    dk_own.update(rec["dict_own"])
+    dk_mro.update(rec["class_mro"])
+    for ctx, pairs in rec["dict_keys"].items():
+        bits, kind = ctx_tests(ctx)
+        if not bits:
+            continue
+        for owner, key in pairs:
+            dk_readers[(owner, key)] |= bits
+
+
+META_FUNCS = {"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "__prepare__"}
+
+
+def hx(b):
+    return format(b, "x")
+
+
+def dict_safety():
+    """Upper-case attributes whose dicts are only read key by key at run time:
+    no metaclass or class-creation use other than copying entries."""
+    bad, copiers = set(), defaultdict(set)
+    for p in files:
+        if not p.startswith("sqlglot/"):
+            continue
+        tree = info[p]["tree"]
+        parents = {}
+        for n in ast.walk(tree):
+            for c in ast.iter_child_nodes(n):
+                parents[c] = n
+
+        def enclosing(n):
+            x = parents.get(n)
+            while x is not None:
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    return x
+                x = parents.get(x)
+            return None
+
+        def owner_class(n):
+            x = parents.get(n)
+            names = []
+            while x is not None:
+                if isinstance(x, ast.ClassDef):
+                    names.append(x.name)
+                x = parents.get(x)
+            return ".".join(reversed(names))
+
+        def is_copy(n):
+            p_ = parents.get(n)
+            if isinstance(p_, ast.Dict) and any(k is None and v is n for k, v in zip(p_.keys, p_.values)):
+                return True
+            if isinstance(p_, ast.Attribute) and p_.attr in ("copy", "items"):
+                if p_.attr == "copy":
+                    return True
+                c = parents.get(p_)
+                g = parents.get(c)
+                return isinstance(c, ast.Call) and isinstance(g, ast.comprehension) and isinstance(parents.get(g), ast.DictComp)
+            if isinstance(p_, ast.Call) and isinstance(p_.func, ast.Name) and p_.func.id == "dict" and n in p_.args:
+                return True
+            return False
+
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+                nm = n.attr
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                nm = n.id
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                nm = n.value
+            else:
+                continue
+            if not nm.isupper():
+                continue
+            fn = enclosing(n)
+            if fn is None:
+                if isinstance(n, ast.Constant):
+                    continue
+                if is_copy(n):
+                    oc = owner_class(n)
+                    if oc:
+                        copiers[nm].add(module_name(p) + ":" + oc)
+                else:
+                    bad.add(nm)
+            elif isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cls = parents.get(fn)
+                meta = isinstance(cls, ast.ClassDef) and any(
+                    isinstance(b, ast.Name) and b.id == "type" for b in cls.bases
+                )
+                if meta or fn.name in META_FUNCS:
+                    bad.add(nm)
+    return bad, copiers
+
+
+dk_bad, dk_copiers = dict_safety()
+subs = defaultdict(list)
+for ck, mro in dk_mro.items():
+    for b in mro:
+        subs[b].append(ck)
+lit_keys = {}
+for p in files:
+    for a, b, q, at, ents, dyn in info[p]["dicts"]:
+        lit_keys[module_name(p) + ":" + q + "|" + at] = sorted({e[0] for e in ents})
+safe_attrs = sorted({o.split("|")[1] for o in dk_wrapped} - dk_bad)
+rd = defaultdict(dict)
+table, tpos = [], {}
+for (owner, key), b in dk_readers.items():
+    if owner.split("|")[1] not in safe_attrs:
+        continue
+    h = hx(b)
+    if h not in tpos:
+        tpos[h] = len(table)
+        table.append(h)
+    rd[owner][key] = tpos[h]
+dicts_out = {
+    "readers": rd,
+    "B": table,
+    "safe": safe_attrs,
+    "wrapped": sorted(dk_wrapped),
+    "own": dk_own,
+    "subs": {k: sorted(set(v)) for k, v in subs.items()},
+    "copiers": {k: sorted(v) for k, v in dk_copiers.items()},
+    "lit": lit_keys,
+}
 
 # test modules imported by other test files (static), and test files themselves
 test_mod_importers = defaultdict(int)
@@ -448,6 +580,7 @@ for p in files:
         "funcs": [[s, e, q, hx(func_bits[p][i])] for i, (s, e, q, _, _) in enumerate(sp)],
         "stmts": [list(x) for x in info[p]["stmts"]],
         "docs": info[p]["docs"],
+        "dicts": [[a, b, q, at, [list(e) for e in ents], dyn] for a, b, q, at, ents, dyn in info[p]["dicts"]],
         "astnd": info[p]["astnd"],
         "istmts": istmts_of(p),
         "family": is_family(p),
@@ -509,6 +642,9 @@ with open(os.path.join(OUT, "index.json"), "w") as f:
         f,
         separators=(",", ":"),
     )
+with open(os.path.join(OUT, "dicts.z"), "wb") as f:
+    f.write(zlib.compress(json.dumps(dicts_out, separators=(",", ":")).encode(), 9))
+print("dict attrs safe", len(dicts_out["safe"]), "owners", len(rd), file=sys.stderr)
 with open(os.path.join(OUT, "names.z"), "wb") as f:
     f.write(zlib.compress(json.dumps({"bits": {k: hx(v) for k, v in name_bits.items()}, "unsafe": sorted(unsafe & set(name_bits))}, separators=(",", ":")).encode(), 9))
 print("files", len(files), "names", len(name_bits), "fixtures opened", len(fix_bits), file=sys.stderr)

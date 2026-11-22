@@ -173,6 +173,7 @@ class Plugin:
         self._mods(state["ctx"])
         set_ctx("after-collect")
         hook_dialects()
+        wrap_dicts()
         yield
 
     @pytest.hookimpl(hookwrapper=True)
@@ -197,6 +198,142 @@ class Plugin:
         yield
         self._mods("teardown|" + item.nodeid)
         set_ctx("between")
+
+
+# ---- key-level tracking of upper-case class dicts --------------------------
+import enum as _enum  # noqa: E402
+
+dict_keys = {}  # ctx -> set((owner, key))
+dict_wrapped = set()  # owners "module:Qual|ATTR" that are tracked
+dict_own = {}  # class key -> upper-case attribute names it defines itself
+class_mro = {}  # class key -> class keys of its MRO
+_UPPER = __import__("re").compile(r"^[A-Z][A-Z0-9_]*$")
+ALL_KEYS = "*"
+
+
+def _kr(k):
+    if isinstance(k, _enum.Enum):
+        return "e:%s.%s" % (type(k).__name__, k.name)
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, type):
+        return "c:" + k.__name__
+    return "r:" + repr(k)
+
+
+def _rec(d, key):
+    ctx = state["ctx"]
+    s = dict_keys.get(ctx)
+    if s is None:
+        s = dict_keys[ctx] = set()
+    s.add((d._o, key))
+
+
+class TrackDict(dict):
+    __slots__ = ("_o",)
+
+    def __getitem__(self, k):
+        _rec(self, _kr(k))
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        _rec(self, _kr(k))
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        _rec(self, _kr(k))
+        return dict.__contains__(self, k)
+
+    def __iter__(self):
+        _rec(self, ALL_KEYS)
+        return dict.__iter__(self)
+
+    def keys(self):
+        _rec(self, ALL_KEYS)
+        return dict.keys(self)
+
+    def items(self):
+        _rec(self, ALL_KEYS)
+        return dict.items(self)
+
+    def values(self):
+        _rec(self, ALL_KEYS)
+        return dict.values(self)
+
+    def copy(self):
+        _rec(self, ALL_KEYS)
+        return dict(dict.items(self))
+
+    def __or__(self, other):
+        _rec(self, ALL_KEYS)
+        return dict(dict.items(self)) | other
+
+    def __ror__(self, other):
+        _rec(self, ALL_KEYS)
+        return other | dict(dict.items(self))
+
+    def __len__(self):
+        _rec(self, ALL_KEYS)
+        return dict.__len__(self)
+
+    def __eq__(self, other):
+        _rec(self, ALL_KEYS)
+        return dict.__eq__(self, other)
+
+    __hash__ = None
+
+    def __reduce__(self):
+        _rec(self, ALL_KEYS)
+        return (dict, (dict(dict.items(self)),))
+
+
+def _ckey(c):
+    return "%s:%s" % (c.__module__, c.__qualname__)
+
+
+def wrap_dicts():
+    import importlib
+    import pkgutil
+
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if info.name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            pass
+    seen = set()
+
+    def visit(cls):
+        if cls in seen:
+            return
+        seen.add(cls)
+        ck = _ckey(cls)
+        class_mro[ck] = [_ckey(b) for b in cls.__mro__ if (getattr(b, "__module__", "") or "").startswith("sqlglot")]
+        own = []
+        for attr, val in list(vars(cls).items()):
+            if isinstance(val, type) and (val.__module__ or "").startswith("sqlglot"):
+                visit(val)
+            elif _UPPER.match(attr):
+                own.append(attr)
+                if type(val) is dict:
+                    td = TrackDict(val)
+                    td._o = ck + "|" + attr
+                    try:
+                        setattr(cls, attr, td)
+                        dict_wrapped.add(td._o)
+                    except Exception:
+                        pass
+        dict_own[ck] = own
+
+    for name, mod in list(sys.modules.items()):
+        if not (name == "sqlglot" or name.startswith("sqlglot.")) or mod is None:
+            continue
+        for v in list(vars(mod).values()):
+            if isinstance(v, type) and v.__module__ == name:
+                visit(v)
 
 
 def hook_dialects():
@@ -334,6 +471,10 @@ with _open(OUT + ".json", "w") as f:
             "dialects": {k: sorted(v) for k, v in dialects.items()},
             "imported": {k: sorted(v) for k, v in imported.items()},
             "classes": classes,
+            "dict_keys": {k: sorted(map(list, v)) for k, v in dict_keys.items()},
+            "dict_wrapped": sorted(dict_wrapped),
+            "dict_own": dict_own,
+            "class_mro": class_mro,
             "unit_cpu": {t: {str(k): v for k, v in d.items()} for t, d in unit_cpu.items()},
         },
         f,
