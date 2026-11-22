@@ -546,6 +546,14 @@ class Selector:
                 use = int(h, 16) if h else 0
                 q = q.rsplit(".", 1)[0] if "." in q else None
             self.ins[1] |= use
+            if is_test and scope == "module" and safe and nms:
+                # a module-level constant of a test module: tests running code
+                # that reads it (anything read at import time stays broad)
+                names = m.names()
+                if all(nm in names and nm not in m._unsafe for nm in nms):
+                    for nm in nms:
+                        bits |= int(names[nm], 16)
+                    continue
             if scope == "class" and use and not is_test:
                 base = use | dial
                 names = m.names()

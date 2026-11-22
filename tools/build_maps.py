@@ -472,8 +472,6 @@ for tf in files:
 # names assigned at module or class level -> tests running functions that read them
 assigned = set()
 for p in files:
-    if not p.startswith("sqlglot/"):
-        continue
 
     def scan(body):
         for st in body:
@@ -513,8 +511,8 @@ def loads_in(node, skip_functions):
 
 unsafe = set()
 for p in files:
-    if not p.startswith("sqlglot/"):
-        continue
+    if p.startswith("tests/") and not imp_bits.get(p, 0):
+        continue  # scripts no test imports (gen_fixtures.py, leakcheck.py)
     tree = info[p]["tree"]
     # read while modules and classes are being built
     for st in tree.body:
