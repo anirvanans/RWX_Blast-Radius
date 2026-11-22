@@ -142,7 +142,119 @@ def transforms_kind():
     return p, new_t, as_patch(p, old_t, new_t)
 
 
+def red_kind():
+    import ast as _ast
+    kind = rng.choice(["default", "decorator", "override", "import", "delmethod", "helpers", "multi"])
+    if kind == "helpers":
+        p = "tests/helpers.py"
+        lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")
+        idx = [i for i, l in enumerate(lines) if re.search(r'(==|!=|"|\b\d+\b)', l) and l.startswith("    ")]
+        if not idx:
+            return None
+        i = rng.choice(idx)
+        nl = lines[:]
+        new = re.sub(r"==", "!=", nl[i], count=1)
+        if new == nl[i]:
+            new = re.sub(r'"([^"]*)"', r'"\1Z"', nl[i], count=1)
+        nl[i] = new
+        old_t, new_t = "\n".join(lines), "\n".join(nl)
+        if old_t == new_t:
+            return None
+        return p, new_t, as_patch(p, old_t, new_t)
+    if kind == "multi":
+        a = mutate_simple()
+        fx = "tests/fixtures/optimizer/redteam_new.sql"
+        add = "SELECT 1;\nSELECT 1;\n"
+        patch = a[2] + "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,2 @@\n+SELECT 1;\n+SELECT 1;\n" % (fx, fx, fx)
+        return a[0], a[1], patch
+    p = rng.choice(files)
+    src = open(os.path.join(ROOT, p), encoding="utf-8").read()
+    lines = src.split("\n")
+    tree = _ast.parse(src)
+    nl = lines[:]
+    if kind == "default":
+        fs = [f for f in _ast.walk(tree) if isinstance(f, _ast.FunctionDef) and any(isinstance(d, _ast.Constant) for d in f.args.defaults + [x for x in f.args.kw_defaults if x])]
+        if not fs:
+            return None
+        f = rng.choice(fs)
+        d = rng.choice([d for d in f.args.defaults + [x for x in f.args.kw_defaults if x] if isinstance(d, _ast.Constant)])
+        if d.lineno != d.end_lineno:
+            return None
+        v = d.value
+        rep = {True: "False", False: "True", None: "0"}.get(v, repr(v + 1) if isinstance(v, int) else '"x"')
+        ln = nl[d.lineno - 1]
+        nl[d.lineno - 1] = ln[: d.col_offset] + rep + ln[d.end_col_offset:]
+    elif kind == "decorator":
+        ds = [(f, d) for f in _ast.walk(tree) if isinstance(f, (_ast.FunctionDef, _ast.ClassDef)) for d in f.decorator_list]
+        if not ds:
+            return None
+        f, d = rng.choice(ds)
+        if d.lineno != d.end_lineno:
+            return None
+        del nl[d.lineno - 1]
+    elif kind == "override":
+        if not (p.startswith("sqlglot/generators/") or p.startswith("sqlglot/parsers/")):
+            return None
+        cs = [c for c in tree.body if isinstance(c, _ast.ClassDef) and c.body]
+        if not cs:
+            return None
+        c = rng.choice(cs)
+        name = rng.choice(["cast_sql", "alias_sql", "column_sql", "table_sql", "select_sql", "literal_sql", "_parse_primary", "_parse_column", "_parse_table"])
+        if name.endswith("_sql") != p.startswith("sqlglot/generators/"):
+            return None
+        body = c.body[-1]
+        ind = " " * (c.col_offset + 4)
+        nl.insert(body.end_lineno, "")
+        nl.insert(body.end_lineno + 1, ind + "def %s(self, *args, **kwargs):" % name)
+        nl.insert(body.end_lineno + 2, ind + "    return super().%s(*args, **kwargs) if False else None" % name)
+    elif kind == "import":
+        im = [n for n in tree.body if isinstance(n, _ast.ImportFrom) and n.lineno == n.end_lineno and n.module and n.module.startswith("sqlglot")]
+        if not im:
+            return None
+        del nl[rng.choice(im).lineno - 1]
+    elif kind == "delmethod":
+        ms = [(c, m) for c in _ast.walk(tree) if isinstance(c, _ast.ClassDef) for m in c.body if isinstance(m, _ast.FunctionDef) and not m.name.startswith("__")]
+        if not ms:
+            return None
+        c, m = rng.choice(ms)
+        start = min([m.lineno] + [d.lineno for d in m.decorator_list])
+        del nl[start - 1 : m.end_lineno]
+    new_t = "\n".join(nl)
+    if new_t == src:
+        return None
+    try:
+        compile(new_t, p, "exec")
+    except SyntaxError:
+        return None
+    return p, new_t, as_patch(p, src, new_t)
+
+
+def mutate_simple():
+    while True:
+        r = None
+        p = rng.choice(files)
+        lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")
+        cands = [(i, pat, rep) for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith("#") for pat, rep in SWAPS if re.search(pat, ln)]
+        if not cands:
+            continue
+        i, pat, rep = rng.choice(cands)
+        nl = lines[:]
+        nl[i] = re.sub(pat, rep, nl[i], count=1)
+        old_t, new_t = "\n".join(lines), "\n".join(nl)
+        try:
+            compile(new_t, p, "exec")
+        except SyntaxError:
+            continue
+        if old_t != new_t:
+            return p, new_t, as_patch(p, old_t, new_t)
+
+
 def mutate():
+    if os.environ.get("RED"):
+        while True:
+            r = red_kind()
+            if r:
+                return r
     if os.environ.get("TRANSFORMS"):
         while True:
             r = transforms_kind()

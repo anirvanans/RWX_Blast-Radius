@@ -578,7 +578,7 @@ for p in files:
     sp = info[p]["spans"]
     entry = {
         "ast": info[p]["ast"],
-        "funcs": [[s, e, q, hx(func_bits[p][i])] for i, (s, e, q, _, _) in enumerate(sp)],
+        "funcs": [[s, e, q, hx(func_bits[p][i]), node.lineno] for i, (s, e, q, _, node) in enumerate(sp)],
         "stmts": [list(x) for x in info[p]["stmts"]],
         "docs": info[p]["docs"],
         "dicts": [[a, b, q, at, [list(e) for e in ents], dyn] for a, b, q, at, ents, dyn in info[p]["dicts"]],

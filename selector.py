@@ -26,6 +26,7 @@ GAMBLE_SHARE = float(os.environ.get("BR_GAMBLE_SHARE", "0"))
 SPLIT_SHARE = float(os.environ.get("BR_SPLIT_SHARE", "0.6"))
 PLAIN_MARGIN_MS = int(os.environ.get("BR_PLAIN_MARGIN", "2500"))
 WALL_BUDGET = 120
+INSURE = os.environ.get("BR_INSURE", "1") == "1"
 # classes whose set-up here costs far more than their recorded time (data loading)
 SLOW_CLASSES = {"tests/test_executor.py::TestExecutor"}  # seconds of the batch's wall time to spend running tests
 
@@ -239,6 +240,17 @@ def load_src(path):
         return f.read()
 
 
+def same_head(old_line, new_ln, new_text):
+    """Is the text before 'lambda' the same on the old line and its new line?"""
+    if new_ln is None or "lambda" not in (old_line or ""):
+        return False
+    nl = new_text.split("\n")
+    new_line = nl[new_ln - 1] if 0 < new_ln <= len(nl) else ""
+    if "lambda" not in new_line:
+        return False
+    return old_line.split("lambda", 1)[0] == new_line.split("lambda", 1)[0]
+
+
 def trivial(line):
     s = line.strip()
     return s == "" or s.startswith("#")
@@ -252,6 +264,7 @@ class Selector:
         self.local_ok = True
         self.sub = {}  # split test (canonical number, as text) -> unit mask or "*"
         self.sub_all = False
+        self.ins = [0, 0, 0, 0]  # insurance: function, class/dialect, file, importers
 
     def add_sub(self, entry, a, b):
         subl = entry.get("subl") or {}
@@ -320,12 +333,16 @@ class Selector:
                 return self.unit(int(m.index["testfile"].get("tests/test_typing.py", "0"), 16))
             return 0
 
+        self.ins[1] |= int(entry["dial"], 16)
+        self.ins[2] |= int(entry["file"], 16)
+        self.ins[3] |= int(entry["imp"], 16)
         funcs = entry["funcs"]
         stmts = entry["stmts"]
         old_strings = entry["strings"]
         bits = 0
         scopes = []  # (scope, safe, names) of statements changed outside functions
         old_lines = old_text.split("\n")
+        rpairs = {o: n for n, o in pairs.items()}
         for ln in deleted:
             txt = old_lines[ln - 1] if 0 < ln <= len(old_lines) else ""
             if trivial(txt) and not S.in_ranges(old_strings, ln):
@@ -339,11 +356,16 @@ class Selector:
                 continue
             if i >= 0:
                 bits |= self.unit(self.in_function(entry, i, ln))
-                if "<lambda" in funcs[i][2] and funcs[i][0] == ln:
+                if "<lambda" in funcs[i][2] and funcs[i][0] == ln and not same_head(txt, rpairs.get(ln), new_text):
                     # the line that opens a lambda also holds what it is bound to
                     # (a dict key, an argument): treat it as a change there too
                     j = S.innermost(stmts, ln)
                     if j >= 0 and not self.inside_function_stmt(funcs, i):
+                        scopes.append(tuple(stmts[j][2:6]))
+                elif funcs[i][0] <= ln < self.def_line(funcs[i]):
+                    # a decorator runs when the def runs: it can register or wrap
+                    j = S.innermost(stmts, ln)
+                    if j >= 0:
                         scopes.append(tuple(stmts[j][2:6]))
             else:
                 j = S.innermost(stmts, ln)
@@ -386,7 +408,10 @@ class Selector:
                         bits |= self.unit(int(funcs[by_q[nsp[i][2]]][3], 16))
                     continue
                 i = S.innermost(nsp, ln)
-                if i >= 0 and nsp[i][3] and nsp[i][0] == ln and not any(
+                o = pairs.get(ln)
+                if i >= 0 and nsp[i][3] and nsp[i][0] == ln and not (
+                    o is not None and same_head(old_lines[o - 1] if 0 < o <= len(old_lines) else "", ln, new_text)
+                ) and not any(
                     sp[0] <= nsp[i][0] and nsp[i][1] <= sp[1] and not sp[3] for sp in nsp
                 ):
                     if nst is None:
@@ -453,6 +478,10 @@ class Selector:
         stripped = S.strip_docstrings(tree)
         return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
 
+    def def_line(self, f):
+        """First line of the def itself (after decorators), from the source."""
+        return f[4] if len(f) > 4 else f[0]
+
     @staticmethod
     def inside_function_stmt(funcs, i):
         """Is lambda i inside a def (so its opening line is code in that def)?"""
@@ -516,6 +545,7 @@ class Selector:
                 h = entry["cls"].get(q)
                 use = int(h, 16) if h else 0
                 q = q.rsplit(".", 1)[0] if "." in q else None
+            self.ins[1] |= use
             if scope == "class" and use and not is_test:
                 base = use | dial
                 names = m.names()
@@ -548,6 +578,7 @@ class Selector:
         ist = entry["istmts"]
         j = S.innermost(ist, ln)
         f = entry["funcs"][fi]
+        self.ins[0] |= int(f[3], 16)
         if j >= 0:
             s_, he, h = ist[j]
             if h is not None and f[0] <= s_ and he <= f[1]:
@@ -571,6 +602,14 @@ class Selector:
     def fixture_change(self, d):
         self.sub_all = True
         b = self.fixture_tests(d)
+        path0 = d["new"] or d["old"] or ""
+        dirp = os.path.dirname(path0)
+        fd = self.maps.index["fixdir"]
+        while dirp and dirp != "tests":
+            if dirp in fd:
+                self.ins[2] |= int(fd[dirp], 16)
+                break
+            dirp = os.path.dirname(dirp)
         path = d["new"] or d["old"]
         if d["binary"] or d["old"] != d["new"]:
             self.local_ok = False
@@ -633,6 +672,7 @@ class Selector:
     def select(self, patch_text):
         self.units, self.edits, self.local_ok = [], {}, True
         self.sub, self.sub_all = {}, False
+        self.ins = [0, 0, 0, 0]
         diffs = parse_patch(patch_text)
         if not diffs:
             return 0 if not patch_text.strip() else ALL
@@ -737,13 +777,14 @@ def main():
         if not name.endswith(".patch"):
             continue
         cid = name[: -len(".patch")]
-        units, edits, local_ok, sub = [], {}, False, None
+        units, edits, local_ok, sub, ins = [], {}, False, None, [0, 0, 0, 0]
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
             bits = sel.select(text)
             units, edits, local_ok = sel.units, sel.edits, sel.local_ok
             sub = None if sel.sub_all else dict(sel.sub)
+            ins = list(sel.ins)
         except Exception as e:  # noqa: BLE001
             log("error", cid, repr(e))
             bits = ALL
@@ -761,7 +802,7 @@ def main():
                 i += 1
             if nums:
                 nums += unknown
-        plan = {"cid": cid, "nums": nums, "run": None, "gamble": False, "split": None}
+        plan = {"cid": cid, "nums": nums, "run": None, "gamble": False, "split": None, "ins": ins}
         if can_run and local_ok and sub and nums and not unknown:
             # slow tests made of independent queries: run only the queries the edit reaches
             subset, drop = {}, []
@@ -848,9 +889,38 @@ def main():
                     p["nums"] = []
                 log(p["cid"], "ran", len(p["run"]), "failed", len(failed), "est", est_cpu(p["run"]))
 
+    def to_nums(b):
+        out_, i = [], 0
+        while b:
+            if b & 1 and i < len(remap) and remap[i] is not None:
+                out_.append(remap[i])
+            b >>= 1
+            i += 1
+        return out_
+
     out = []
     for p in plans:
         workers = pack(p["nums"], ms)
+        if workers and INSURE:
+            # free insurance: fill the other workers' idle time, never past the
+            # busiest worker, with tests that run code near the change
+            loads = [sum(ms[n] for n in w) for w in workers]
+            top = max(loads)
+            taken = set(p["nums"])
+            added = 0
+            for tier in p["ins"]:
+                for n in sorted(to_nums(tier), key=lambda n: -ms[n]):
+                    if n in taken:
+                        continue
+                    for j in sorted(range(len(workers)), key=lambda j: loads[j]):
+                        if loads[j] + ms[n] <= top:
+                            workers[j].append(n)
+                            loads[j] += ms[n]
+                            taken.add(n)
+                            added += 1
+                            break
+            if added:
+                log(p["cid"], "insured", added)
         out.append(json.dumps({"commit": p["cid"], "workers": workers}, separators=(",", ":")))
         log(p["cid"], len(p["nums"]), "tests")
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
