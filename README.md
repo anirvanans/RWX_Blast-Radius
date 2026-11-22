@@ -18,6 +18,8 @@ At run time `selector.py` reads each patch and:
 5. SQL fixtures: the tests that open that file.
 6. Anything unrecognised: every test.
 
+When the picked tests include slow ones and every changed place is also run by fast tests, or when only fast tests are picked and running them here is cheaper than a worker, `local.py` rebuilds the patched tree in `/tmp` (symlinks to `tree/`, the pristine sqlglot checkout) and `runner.py` runs the fast tests there, stopping at the first failure. If none fails, nothing is printed for that commit; otherwise the full pick stands. Its CPU time is charged, so this only happens when the expected saving is clearly larger.
+
 Tests are then packed onto 1–8 workers, longest first, choosing the count with the lowest busiest-worker time plus 2 s per worker.
 
 ## Rebuilding the maps
@@ -30,4 +32,4 @@ SKIP_INTEGRATION=0 python ../tools/collect.py /tmp/B <all other test files>
 python ../tools/build_maps.py . tests.json ../maps /tmp/A /tmp/B
 ```
 
-`src/` holds the pristine `.py` files of sqlglot at that commit (MIT licensed) so patches can be applied and parsed without the network.
+`tree/` holds sqlglot at that commit (MIT licensed: sources, tests, fixtures) so patches can be applied, parsed and tested without the network. `requirements.lock` is the kit's labeling environment.

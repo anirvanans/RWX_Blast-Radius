@@ -18,7 +18,15 @@ sys.path.insert(0, HERE)
 import spans as S  # noqa: E402
 DATA = os.environ.get("BR_DATA", "/data")
 MAPS = os.path.join(HERE, "maps")
-SRC = os.path.join(HERE, "src")  # pristine sqlglot sources (.py only)
+TREE = os.environ.get("BR_TREE", os.path.join(HERE, "tree"))  # pristine sqlglot checkout with tests
+SRC = TREE
+LIGHT_MS = 1000  # tests at most this long may be run here
+LOCAL_BUDGET_MS = 4000  # most recorded test time to run here for one commit
+GAMBLE_SHARE = float(os.environ.get("BR_GAMBLE_SHARE", "0.3"))
+PLAIN_MARGIN_MS = int(os.environ.get("BR_PLAIN_MARGIN", "2500"))
+WALL_BUDGET = 120
+# classes whose set-up here costs far more than their recorded time (data loading)
+SLOW_CLASSES = {"tests/test_executor.py::TestExecutor"}  # seconds of the batch's wall time to spend running tests
 
 ALL = "ALL"
 CONST = re.compile(r"^(?:[A-Z][A-Z0-9_]*|arg_types)$")
@@ -225,6 +233,13 @@ def trivial(line):
 class Selector:
     def __init__(self, maps):
         self.maps = maps
+        self.units = []  # one bitset for every changed place
+        self.edits = {}  # path -> new text (None: deleted), to rebuild the patched tree
+        self.local_ok = True
+
+    def unit(self, b):
+        self.units.append(b)
+        return b
 
     def all_tests(self):
         return ALL
@@ -241,6 +256,7 @@ class Selector:
             return ALL  # renamed module: imports of the old name break
         if new_path is None:
             # deleted module or test file
+            self.local_ok = False
             if is_test:
                 e = m.file(old_path)
                 return int(e["imp"], 16) if e else ALL
@@ -253,17 +269,19 @@ class Selector:
                 return ALL
             if self.referenced(base, mod):
                 return ALL
+            self.edits[new_path] = apply_hunks("", d["hunks"])[0]
             return 0
 
         old_text = load_src(path)
         if old_text is None:
             return ALL
         new_text, deleted, added, pairs = apply_hunks(old_text, d["hunks"])
+        self.edits[path] = new_text
         try:
             tree = ast.parse(new_text)
         except SyntaxError:
             # the module cannot be imported: every test that imports it fails
-            return int(entry["imp"], 16) | int(entry["file"], 16) | int(entry["dial"], 16)
+            return self.unit(int(entry["imp"], 16) | int(entry["file"], 16) | int(entry["dial"], 16))
         if hashlib.sha1(ast.dump(tree).encode()).hexdigest() == entry["ast"]:
             return 0  # same code: only comments or layout changed
 
@@ -279,7 +297,7 @@ class Selector:
                 continue
             i = S.innermost(funcs, ln)
             if i >= 0:
-                bits |= self.in_function(entry, i, ln)
+                bits |= self.unit(self.in_function(entry, i, ln))
             else:
                 j = S.innermost(stmts, ln)
                 scopes.append(tuple(stmts[j][2:6]) if j >= 0 else ("module", False, [], None))
@@ -299,9 +317,9 @@ class Selector:
                     o = pairs.get(ln)
                     if o is not None and S.innermost(funcs, o) == fi:
                         # a line replaced in place: what runs it is what ran the old line
-                        bits |= self.in_function(entry, fi, o)
+                        bits |= self.unit(self.in_function(entry, fi, o))
                     else:
-                        bits |= int(funcs[fi][3], 16)
+                        bits |= self.unit(int(funcs[fi][3], 16))
                     continue
                 if nst is None:
                     nst = S.statements(tree)
@@ -313,7 +331,7 @@ class Selector:
                     j = S.innermost(nst, ln)
                 scopes.append(tuple(nst[j][2:6]) if j >= 0 else ("module", False, [], None))
         if scopes:
-            bits |= self.scope_tests(entry, scopes, is_test)
+            bits |= self.unit(self.scope_tests(entry, scopes, is_test))
         return bits
 
     def scope_tests(self, entry, scopes, is_test):
@@ -383,6 +401,20 @@ class Selector:
         return False
 
     def fixture_change(self, d):
+        b = self.fixture_tests(d)
+        path = d["new"] or d["old"]
+        if d["binary"] or d["old"] != d["new"]:
+            self.local_ok = False
+        else:
+            orig = os.path.join(TREE, path)
+            try:
+                with open(orig, encoding="utf-8") as f:
+                    self.edits[path] = apply_hunks(f.read(), d["hunks"])[0]
+            except Exception:  # noqa: BLE001
+                self.local_ok = False
+        return self.unit(b)
+
+    def fixture_tests(self, d):
         m = self.maps
         path = d["old"] or d["new"]
         fix = m.index["fix"]
@@ -411,6 +443,7 @@ class Selector:
             return 0
         if path.startswith("sqlglotc/"):
             # tests/test_sqlglotc.py runs sqlglotc/setup.py
+            self.local_ok = False
             return int(self.maps.index["testfile"].get("tests/test_sqlglotc.py", "0"), 16) or ALL
         if path == "sqlglot/py.typed":
             return 0
@@ -427,6 +460,7 @@ class Selector:
         return ALL
 
     def select(self, patch_text):
+        self.units, self.edits, self.local_ok = [], {}, True
         diffs = parse_patch(patch_text)
         if not diffs:
             return 0 if not patch_text.strip() else ALL
@@ -462,46 +496,149 @@ def pack(numbers, ms):
     return [b for b in best[1] if b]
 
 
+def _group(nums, id_of):
+    """Tests grouped by their class."""
+    g = {}
+    for n in nums:
+        g.setdefault(id_of[n].rsplit("::", 1)[0], []).append(n)
+    return list(g.values())
+
+
+def cost_ms(numbers, ms):
+    if not numbers:
+        return 0
+    order = sorted(numbers, key=lambda n: -ms[n])
+    best = None
+    for k in range(1, min(8, len(order)) + 1):
+        loads = [0] * k
+        for n in order:
+            j = loads.index(min(loads))
+            loads[j] += ms[n]
+        c = max(loads) + 2000 * k
+        best = c if best is None or c < best else best
+    return best
+
+
 def main():
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    t0 = time.time()
     with open(os.path.join(DATA, "tests.json")) as f:
         tj = json.load(f)
     tests = tj["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    id_of = {t["number"]: t["id"] for t in tests}
     maps = Maps()
     canon = maps.index["ids"]
     num_of = {t["id"]: t["number"] for t in tests}
     remap = [num_of.get(i) for i in canon]
     known = {n for n in remap if n is not None}
     unknown = [t["number"] for t in tests if t["number"] not in known]
+    def runnable(n):
+        return ms[n] <= LIGHT_MS and id_of[n].rsplit("::", 1)[0] not in SLOW_CLASSES
+
+    light_mask = 0
+    for i, n in enumerate(remap):
+        if n is not None and runnable(n):
+            light_mask |= 1 << i
+    can_run = os.path.isdir(os.path.join(TREE, "tests")) and os.environ.get("BR_LOCAL", "1") == "1"
+    try:
+        with open(os.path.join(MAPS, "setup.json")) as f:
+            setup = json.load(f)
+    except Exception:  # noqa: BLE001
+        setup = {"base": 100, "class": {}}
+
+    def est_cpu(light):
+        """Expected CPU (ms) to run these tests here: start-up, each class's set-up, the tests."""
+        heads = sorted((setup["class"].get(id_of[n].rsplit("::", 1)[0], 300) for n in {
+            min(g) for g in _group(light, id_of)}), reverse=True)
+        total = setup["base"] + sum(ms[n] for n in light)
+        if heads:
+            total += heads[0] + sum(max(h - 150, 20) for h in heads[1:])
+        return total
+
     sel = Selector(maps)
     cdir = os.path.join(DATA, "commits")
-    out = []
+    plans = []
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
         cid = name[: -len(".patch")]
+        units, edits, local_ok = [], {}, False
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
             bits = sel.select(text)
+            units, edits, local_ok = sel.units, sel.edits, sel.local_ok
         except Exception as e:  # noqa: BLE001
             log("error", cid, repr(e))
             bits = ALL
         if bits == ALL:
             nums = [t["number"] for t in tests]
+            local_ok = False
         else:
             nums = []
             i = 0
-            while bits:
-                if bits & 1 and i < len(remap) and remap[i] is not None:
+            b = bits
+            while b:
+                if b & 1 and i < len(remap) and remap[i] is not None:
                     nums.append(remap[i])
-                bits >>= 1
+                b >>= 1
                 i += 1
             if nums:
                 nums += unknown
-        workers = pack(nums, ms)
-        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
-        log(cid, len(nums), "tests")
+        plan = {"cid": cid, "nums": nums, "run": None, "gamble": False}
+        if can_run and local_ok and nums and not unknown:
+            light = [n for n in nums if runnable(n)]
+            heavy = [n for n in nums if not runnable(n)]
+            covered = all((u & light_mask) for u in units if u)
+            spend = sum(ms[n] for n in light)
+            if light and spend <= LOCAL_BUDGET_MS:
+                est = est_cpu(light)
+                full = cost_ms(nums, ms)
+                if heavy and covered and est < GAMBLE_SHARE * full:
+                    plan.update(run=light, heavy=heavy, gamble=True, edits=edits)
+                elif not heavy and est < full - PLAIN_MARGIN_MS:
+                    plan.update(run=light, heavy=[], edits=edits)
+        plans.append(plan)
+
+    todo = [p for p in plans if p["run"]]
+    # exclude classes whose set-up alone is costly
+    for p in todo if False else []:
+        pass
+    if todo:
+        import local
+
+        def go(p):
+            if time.time() - t0 > WALL_BUDGET:
+                return p, None
+            root = os.path.join("/tmp", "o", p["cid"])
+            try:
+                local.make_overlay(root, p["edits"])
+                spend = sum(ms[n] for n in p["run"])
+                order = sorted(p["run"], key=lambda n: ms[n])
+                res = local.run_tests(root, [id_of[n] for n in order], timeout=10 + 4 * spend / 1000, failfast=True)
+            except Exception as e:  # noqa: BLE001
+                log("local error", p["cid"], repr(e))
+                res = None
+            return p, res
+
+        with ThreadPoolExecutor(2) as ex:
+            for p, res in ex.map(go, todo):
+                if res is None:
+                    continue
+                failed = [n for n in p["run"] if id_of[n] in res]
+                if not failed:
+                    # every test that runs the edit passes here: nothing to run
+                    p["nums"] = []
+                log(p["cid"], "ran", len(p["run"]), "failed", len(failed), "est", est_cpu(p["run"]))
+
+    out = []
+    for p in plans:
+        workers = pack(p["nums"], ms)
+        out.append(json.dumps({"commit": p["cid"], "workers": workers}, separators=(",", ":")))
+        log(p["cid"], len(p["nums"]), "tests")
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 

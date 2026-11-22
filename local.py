@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TREE = os.environ.get("BR_TREE", "/opt/sqlglot")
+TREE = os.environ.get("BR_TREE", os.path.join(HERE, "tree"))
 RUNNER = os.path.join(HERE, "runner.py")
 
 
@@ -53,7 +53,7 @@ def make_overlay(root, files):
     return root
 
 
-def run_tests(root, ids, timeout):
+def run_tests(root, ids, timeout, failfast=False):
     """Run test ids in the patched tree. Returns a set of failing ids, or None if unsure."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -62,23 +62,24 @@ def run_tests(root, ids, timeout):
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
     }
+    args = [sys.executable, "-E", RUNNER] + (["--failfast"] if failfast else []) + list(ids)
+    p = subprocess.Popen(args, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        p = subprocess.run(
-            [sys.executable, "-S" if False else "-E", RUNNER, *ids],
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        out, _ = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
         return None
+    LAST_CPU[0] = None
     if p.returncode != 0:
         return None
     try:
-        return set(json.loads(p.stdout.strip().splitlines()[-1]))
+        return set(json.loads(out.decode().strip().splitlines()[-1]))
     except Exception:  # noqa: BLE001
         return None
+
+
+LAST_CPU = [None]
 
 
 def cpu_children():
