@@ -435,6 +435,8 @@ class Selector:
                     # a new function or lambda: it matters through the
                     # statement that holds it
                     j = S.innermost(nst, nsp[i][0])
+                    if j >= 0 and self.new_plain_function(nst[j], new_lines, stmts):
+                        continue
                 else:
                     j = S.innermost(nst, ln)
                 scopes.append(tuple(nst[j][2:6]) if j >= 0 else ("module", False, [], None))
@@ -477,6 +479,23 @@ class Selector:
             return False
         stripped = S.strip_docstrings(tree)
         return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
+
+    @staticmethod
+    def new_plain_function(st, new_lines, old_stmts):
+        """A module-level def with no decorators under a name the module did not
+        have: nothing can call it unless another changed line does (and that
+        line is judged on its own)."""
+        start, _, scope, _, names, _ = st[:6]
+        if scope != "module" or len(names) != 1:
+            return False
+        head = new_lines[start - 1].lstrip() if 0 < start <= len(new_lines) else ""
+        if not head.startswith("def "):
+            return False
+        name = names[0]
+        if name.endswith("_sql") or name.startswith("__"):
+            return False
+        old_names = {nm for o in old_stmts if o[2] == "module" for nm in o[4]}
+        return name not in old_names
 
     def def_line(self, f):
         """First line of the def itself (after decorators), from the source."""
@@ -906,6 +925,7 @@ def main():
             i += 1
         return out_
 
+    ALL_BITS = (1 << len(remap)) - 1
     out = []
     for p in plans:
         workers = pack(p["nums"], ms)
@@ -916,8 +936,10 @@ def main():
             top = max(loads)
             taken = set(p["nums"])
             added = 0
-            for tier in p["ins"]:
+            for tier in p["ins"] + [ALL_BITS]:
                 for n in sorted(to_nums(tier), key=lambda n: -ms[n]):
+                    if min(loads) >= top:
+                        break
                     if n in taken:
                         continue
                     for j in sorted(range(len(workers)), key=lambda j: loads[j]):
