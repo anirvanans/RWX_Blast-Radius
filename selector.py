@@ -435,7 +435,7 @@ class Selector:
                     # a new function or lambda: it matters through the
                     # statement that holds it
                     j = S.innermost(nst, nsp[i][0])
-                    if j >= 0 and self.new_plain_function(nst[j], new_lines, stmts):
+                    if j >= 0 and self.new_plain_function(nst[j], new_lines, stmts, tree):
                         continue
                 else:
                     j = S.innermost(nst, ln)
@@ -481,7 +481,7 @@ class Selector:
         return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
 
     @staticmethod
-    def new_plain_function(st, new_lines, old_stmts):
+    def new_plain_function(st, new_lines, old_stmts, tree):
         """A module-level def with no decorators under a name the module did not
         have: nothing can call it unless another changed line does (and that
         line is judged on its own)."""
@@ -495,7 +495,36 @@ class Selector:
         if name.endswith("_sql") or name.startswith("__"):
             return False
         old_names = {nm for o in old_stmts if o[2] == "module" for nm in o[4]}
-        return name not in old_names
+        if name in old_names:
+            return False
+        node = Selector._find_def(tree, name)
+        if node is None or node.decorator_list:
+            return False
+        # defaults (and annotations, unless postponed) run when the def runs
+        a = node.args
+        for d in a.defaults + [x for x in a.kw_defaults if x is not None]:
+            if not isinstance(d, ast.Constant):
+                return False
+        postponed = any(
+            isinstance(st, ast.ImportFrom) and st.module == "__future__" and any(n.name == "annotations" for n in st.names)
+            for st in tree.body
+        )
+        if not postponed:
+            anns = [x.annotation for x in a.args + a.posonlyargs + a.kwonlyargs if x.annotation] + [node.returns]
+            if a.vararg and a.vararg.annotation:
+                anns.append(a.vararg.annotation)
+            if a.kwarg and a.kwarg.annotation:
+                anns.append(a.kwarg.annotation)
+            if any(x is not None and not isinstance(x, ast.Constant) for x in anns):
+                return False
+        return True
+
+    @staticmethod
+    def _find_def(tree, name):
+        for st in tree.body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == name:
+                return st
+        return None
 
     def def_line(self, f):
         """First line of the def itself (after decorators), from the source."""
@@ -806,9 +835,15 @@ def main():
         cid = name[: -len(".patch")]
         units, edits, local_ok, sub, ins = [], {}, False, None, [0, 0, 0, 0]
         try:
-            with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            bits = sel.select(text)
+            with open(os.path.join(cdir, name), "rb") as f:
+                raw = f.read()
+            try:
+                text = raw.decode("utf-8")
+                bits = sel.select(text)
+            except UnicodeDecodeError:
+                # bytes we cannot read as source: the file may not even import
+                log(cid, "not utf-8: every test")
+                bits = ALL
             units, edits, local_ok = sel.units, sel.edits, sel.local_ok
             sub = None if sel.sub_all else dict(sel.sub)
             ins = list(sel.ins)
@@ -926,6 +961,11 @@ def main():
         return out_
 
     ALL_BITS = (1 << len(remap)) - 1
+    POOL_CLASS = "tests/test_optimizer.py::TestOptimizer::"
+    pool_bits = 0
+    for i, n in enumerate(remap):
+        if n is not None and id_of[n].startswith(POOL_CLASS):
+            pool_bits |= 1 << i
     out = []
     for p in plans:
         workers = pack(p["nums"], ms)
@@ -936,8 +976,15 @@ def main():
             top = max(loads)
             taken = set(p["nums"])
             added = 0
-            for tier in p["ins"] + [ALL_BITS]:
-                for n in sorted(to_nums(tier), key=lambda n: -ms[n]):
+            tiers = list(p["ins"]) + [ALL_BITS]
+            order = [False] * len(tiers)
+            if any(id_of[n].startswith(POOL_CLASS) for n in p["nums"]):
+                # the optimizer tests share one process pool: if one of them
+                # hangs, its siblings can time out too
+                tiers.insert(0, pool_bits)
+                order.insert(0, True)
+            for tier, asc in zip(tiers, order):
+                for n in sorted(to_nums(tier), key=(lambda n: ms[n]) if asc else (lambda n: -ms[n])):
                     if min(loads) >= top:
                         break
                     if n in taken:
