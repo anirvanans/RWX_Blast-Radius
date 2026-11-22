@@ -32,6 +32,22 @@ def _roundtrip(obj):
     return pickle.loads(ForkingPickler.dumps(obj))
 
 
+# tests whose work is split into independent units (one per query): each unit
+# gets its own coverage context "call|<test>#<k>"
+SPLIT = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+}
+unit_state = {"test": None, "k": 0}
+unit_cpu = {}  # test -> {k: cpu seconds}
+
+
+def _unit_ctx(k):
+    t = unit_state["test"]
+    if t is not None:
+        set_ctx("call|%s#%d" % (t, k))
+
+
 class InlineExecutor(concurrent.futures.Executor):
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer is not None:
@@ -39,12 +55,22 @@ class InlineExecutor(concurrent.futures.Executor):
             initializer(*initargs)
 
     def submit(self, fn, /, *args, **kwargs):
+        import time as _t
+
         f = concurrent.futures.Future()
+        k = unit_state["k"]
+        _unit_ctx(k)
+        c0 = _t.process_time()
         try:
             fn, args, kwargs = _roundtrip((fn, args, kwargs))
             f.set_result(_roundtrip(fn(*args, **kwargs)))
         except BaseException as e:  # noqa: BLE001
             f.set_exception(e)
+        if unit_state["test"] is not None:
+            d = unit_cpu.setdefault(unit_state["test"], {})
+            d[k] = d.get(k, 0) + _t.process_time() - c0
+            unit_state["k"] = k + 1
+            _unit_ctx(k + 1)
         return f
 
     def shutdown(self, wait=True, *, cancel_futures=False):
@@ -158,7 +184,11 @@ class Plugin:
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item):
         set_ctx("call|" + item.nodeid)
+        if item.nodeid in SPLIT:
+            unit_state["test"], unit_state["k"] = item.nodeid, 0
+            _unit_ctx(0)
         yield
+        unit_state["test"] = None
         self._mods("call|" + item.nodeid)
 
     @pytest.hookimpl(hookwrapper=True)
@@ -228,6 +258,37 @@ def hook_dialects():
     Dialect.__init__ = dinit
 
 
+import contextlib  # noqa: E402
+import re as _re  # noqa: E402
+import unittest  # noqa: E402
+
+_orig_subtest = unittest.TestCase.subTest
+
+
+@contextlib.contextmanager
+def _subtest(self, msg=None, **params):
+    t = unit_state["test"]
+    m = _re.match(r"tpc-(?:h|ds) (\d+)$", str(msg)) if t else None
+    if m:
+        import time as _t
+
+        k = int(m.group(1)) - 1
+        _unit_ctx(k)
+        c0 = _t.process_time()
+        try:
+            with _orig_subtest(self, msg, **params):
+                yield
+        finally:
+            d = unit_cpu.setdefault(t, {})
+            d[k] = d.get(k, 0) + _t.process_time() - c0
+            set_ctx("call|" + t)
+    else:
+        with _orig_subtest(self, msg, **params):
+            yield
+
+
+unittest.TestCase.subTest = _subtest
+
 set_ctx("boot")
 rc = pytest.main(["-q", "-p", "no:cacheprovider", "-p", "no:randomly", *FILES], plugins=[Plugin()])
 cov.stop()
@@ -273,6 +334,7 @@ with _open(OUT + ".json", "w") as f:
             "dialects": {k: sorted(v) for k, v in dialects.items()},
             "imported": {k: sorted(v) for k, v in imported.items()},
             "classes": classes,
+            "unit_cpu": {t: {str(k): v for k, v in d.items()} for t, d in unit_cpu.items()},
         },
         f,
     )

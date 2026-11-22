@@ -190,3 +190,25 @@ def inner_statements(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             visit(n.body)
     return out
+
+
+def docstrings(tree):
+    """Docstring nodes: the leading string of a module, class or function body."""
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = n.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                out.append((n, b[0]))
+    return out
+
+
+def doc_ranges(tree):
+    return [(d.lineno, d.end_lineno) for _, d in docstrings(tree)]
+
+
+def strip_docstrings(tree):
+    """Remove docstrings in place (a body left empty gets a pass)."""
+    for owner, d in docstrings(tree):
+        owner.body = owner.body[1:] or [ast.Pass()]
+    return tree

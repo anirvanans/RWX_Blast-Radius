@@ -36,7 +36,96 @@ for d, _, fs in os.walk(os.path.join(ROOT, "sqlglot")):
 files.sort()
 
 
+FIXTURES = []
+for d, _, fs in os.walk(os.path.join(ROOT, "tests", "fixtures")):
+    for f in fs:
+        if f.endswith(".sql"):
+            FIXTURES.append(os.path.relpath(os.path.join(d, f), ROOT))
+TESTFILES = []
+for d, _, fs in os.walk(os.path.join(ROOT, "tests")):
+    if "fixtures" in d or "__pycache__" in d:
+        continue
+    for f in fs:
+        if f.startswith("test_") and f.endswith(".py"):
+            TESTFILES.append(os.path.relpath(os.path.join(d, f), ROOT))
+
+
+def as_patch(p, old_t, new_t):
+    diff = "".join(difflib.unified_diff(old_t.splitlines(True), new_t.splitlines(True), "a/" + p, "b/" + p, n=3))
+    return "diff --git a/%s b/%s\n%s" % (p, p, diff)
+
+
+def other_kind():
+    kind = rng.choice(["del", "ins_return", "fixture", "fixture_comment", "testedit", "swap"])
+    if kind == "swap":
+        return None
+    if kind in ("fixture", "fixture_comment"):
+        p = rng.choice(FIXTURES)
+        lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")
+        idx = [i for i, l in enumerate(lines) if l.strip() and not l.startswith("#")]
+        if not idx:
+            return None
+        i = rng.choice(idx)
+        nl = lines[:]
+        if kind == "fixture":
+            m = list(re.finditer(r"[a-z]", nl[i]))
+            if not m:
+                return None
+            j = rng.choice(m).start()
+            nl[i] = nl[i][:j] + ("x" if nl[i][j] != "x" else "y") + nl[i][j + 1:]
+        else:
+            nl.insert(i, "-- a note")
+        old_t, new_t = "\n".join(lines), "\n".join(nl)
+        return p, new_t, as_patch(p, old_t, new_t)
+    if kind == "testedit":
+        p = rng.choice(TESTFILES)
+        lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")
+        idx = [i for i, l in enumerate(lines) if re.search(r'"[A-Za-z ]{3,}', l) and l.startswith("        ")]
+        if not idx:
+            return None
+        i = rng.choice(idx)
+        nl = lines[:]
+        nl[i] = re.sub(r'"([A-Za-z])', r'"Z\1', nl[i], count=1)
+        old_t, new_t = "\n".join(lines), "\n".join(nl)
+        return p, new_t, as_patch(p, old_t, new_t)
+    p = rng.choice(files)
+    src = open(os.path.join(ROOT, p), encoding="utf-8").read()
+    lines = src.split("\n")
+    import ast as _ast
+    tree = _ast.parse(src)
+    funcs = [n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))]
+    if not funcs:
+        return None
+    f = rng.choice(funcs)
+    nl = lines[:]
+    if kind == "ins_return":
+        first = f.body[0]
+        if isinstance(first, _ast.Expr) and isinstance(getattr(first, "value", None), _ast.Constant) and len(f.body) > 1:
+            first = f.body[1]
+        indent = lines[first.lineno - 1][: len(lines[first.lineno - 1]) - len(lines[first.lineno - 1].lstrip())]
+        nl.insert(first.lineno - 1, indent + "return None")
+    else:
+        simple = [st for st in _ast.walk(f) if isinstance(st, (_ast.Assign, _ast.Expr, _ast.AugAssign)) and st.lineno == st.end_lineno]
+        if not simple:
+            return None
+        st = rng.choice(simple)
+        del nl[st.lineno - 1]
+    new_t = "\n".join(nl)
+    try:
+        compile(new_t, p, "exec")
+    except SyntaxError:
+        return None
+    return p, new_t, as_patch(p, src, new_t)
+
+
 def mutate():
+    if os.environ.get("MIX"):
+        while True:
+            r = other_kind()
+            if r:
+                return r
+            if rng.random() < 0.3:
+                break
     while True:
         p = rng.choice(files)
         lines = open(os.path.join(ROOT, p), encoding="utf-8").read().split("\n")

@@ -22,7 +22,8 @@ TREE = os.environ.get("BR_TREE", os.path.join(HERE, "tree"))  # pristine sqlglot
 SRC = TREE
 LIGHT_MS = 1000  # tests at most this long may be run here
 LOCAL_BUDGET_MS = 4000  # most recorded test time to run here for one commit
-GAMBLE_SHARE = float(os.environ.get("BR_GAMBLE_SHARE", "0.3"))
+GAMBLE_SHARE = float(os.environ.get("BR_GAMBLE_SHARE", "0"))
+SPLIT_SHARE = float(os.environ.get("BR_SPLIT_SHARE", "0.6"))
 PLAIN_MARGIN_MS = int(os.environ.get("BR_PLAIN_MARGIN", "2500"))
 WALL_BUDGET = 120
 # classes whose set-up here costs far more than their recorded time (data loading)
@@ -236,6 +237,20 @@ class Selector:
         self.units = []  # one bitset for every changed place
         self.edits = {}  # path -> new text (None: deleted), to rebuild the patched tree
         self.local_ok = True
+        self.sub = {}  # split test (canonical number, as text) -> unit mask or "*"
+        self.sub_all = False
+
+    def add_sub(self, entry, a, b):
+        subl = entry.get("subl") or {}
+        for ln in range(a, b + 1):
+            d = subl.get(str(ln))
+            if not d:
+                continue
+            for n, v in d.items():
+                if v == "*" or self.sub.get(n) == "*":
+                    self.sub[n] = "*"
+                else:
+                    self.sub[n] = self.sub.get(n, 0) | int(v, 16)
 
     def unit(self, b):
         self.units.append(b)
@@ -281,9 +296,16 @@ class Selector:
             tree = ast.parse(new_text)
         except SyntaxError:
             # the module cannot be imported: every test that imports it fails
+            self.sub_all = True
             return self.unit(int(entry["imp"], 16) | int(entry["file"], 16) | int(entry["dial"], 16))
         if hashlib.sha1(ast.dump(tree).encode()).hexdigest() == entry["ast"]:
             return 0  # same code: only comments or layout changed
+        if self.docstring_only(entry, old_text, new_text, deleted, added, tree):
+            # nothing reads docstrings, except tests/test_typing.py, which
+            # compares function code objects (a docstring is one of their constants)
+            if path.startswith("sqlglot/typing/"):
+                return self.unit(int(m.index["testfile"].get("tests/test_typing.py", "0"), 16))
+            return 0
 
         funcs = entry["funcs"]
         stmts = entry["stmts"]
@@ -319,6 +341,7 @@ class Selector:
                         # a line replaced in place: what runs it is what ran the old line
                         bits |= self.unit(self.in_function(entry, fi, o))
                     else:
+                        self.add_sub(entry, funcs[fi][0], funcs[fi][1])
                         bits |= self.unit(int(funcs[fi][3], 16))
                     continue
                 if nst is None:
@@ -330,9 +353,31 @@ class Selector:
                 else:
                     j = S.innermost(nst, ln)
                 scopes.append(tuple(nst[j][2:6]) if j >= 0 else ("module", False, [], None))
+        if scopes or is_test:
+            self.sub_all = True
         if scopes:
             bits |= self.unit(self.scope_tests(entry, scopes, is_test))
         return bits
+
+    @staticmethod
+    def docstring_only(entry, old_text, new_text, deleted, added, tree):
+        """Are all changed lines inside docstrings, with the rest of the code identical?"""
+        olds = entry.get("docs") or []
+        if not olds and not deleted:
+            return False
+        ol = old_text.split("\n")
+        for ln in deleted:
+            if not S.in_ranges(olds, ln) and not trivial(ol[ln - 1] if 0 < ln <= len(ol) else ""):
+                return False
+        news = S.doc_ranges(tree)
+        nl = new_text.split("\n")
+        for ln in added:
+            if not S.in_ranges(news, ln) and not trivial(nl[ln - 1] if 0 < ln <= len(nl) else ""):
+                return False
+        if not entry.get("astnd"):
+            return False
+        stripped = S.strip_docstrings(tree)
+        return hashlib.sha1(ast.dump(stripped).encode()).hexdigest() == entry["astnd"]
 
     def scope_tests(self, entry, scopes, is_test):
         """Tests for changes at class or module level."""
@@ -376,17 +421,18 @@ class Selector:
                 bits |= int(entry["imp"], 16)
         return bits
 
-    @staticmethod
-    def in_function(entry, fi, ln):
+    def in_function(self, entry, fi, ln):
         """Tests for an old line inside function fi: its statement if visible, else the function."""
         ist = entry["istmts"]
         j = S.innermost(ist, ln)
+        f = entry["funcs"][fi]
         if j >= 0:
             s_, he, h = ist[j]
-            f = entry["funcs"][fi]
             if h is not None and f[0] <= s_ and he <= f[1]:
+                self.add_sub(entry, s_, he)
                 return int(h, 16)
-        return int(entry["funcs"][fi][3], 16)
+        self.add_sub(entry, f[0], f[1])
+        return int(f[3], 16)
 
     def referenced(self, base, mod):
         """Does any pristine source mention this new module?"""
@@ -401,6 +447,7 @@ class Selector:
         return False
 
     def fixture_change(self, d):
+        self.sub_all = True
         b = self.fixture_tests(d)
         path = d["new"] or d["old"]
         if d["binary"] or d["old"] != d["new"]:
@@ -437,6 +484,8 @@ class Selector:
 
     def change(self, d):
         path = d["new"] or d["old"] or ""
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            self.sub_all = True
         if d.get("bad"):
             return ALL
         if path in INERT_FILES or path.startswith(INERT_PREFIXES):
@@ -461,6 +510,7 @@ class Selector:
 
     def select(self, patch_text):
         self.units, self.edits, self.local_ok = [], {}, True
+        self.sub, self.sub_all = {}, False
         diffs = parse_patch(patch_text)
         if not diffs:
             return 0 if not patch_text.strip() else ALL
@@ -542,7 +592,7 @@ def main():
     for i, n in enumerate(remap):
         if n is not None and runnable(n):
             light_mask |= 1 << i
-    can_run = os.path.isdir(os.path.join(TREE, "tests")) and os.environ.get("BR_LOCAL", "1") == "1"
+    can_run = os.path.isdir(os.path.join(TREE, "tests")) and os.environ.get("BR_LOCAL", "0") == "1"
     try:
         with open(os.path.join(MAPS, "setup.json")) as f:
             setup = json.load(f)
@@ -565,12 +615,13 @@ def main():
         if not name.endswith(".patch"):
             continue
         cid = name[: -len(".patch")]
-        units, edits, local_ok = [], {}, False
+        units, edits, local_ok, sub = [], {}, False, None
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as f:
                 text = f.read()
             bits = sel.select(text)
             units, edits, local_ok = sel.units, sel.edits, sel.local_ok
+            sub = None if sel.sub_all else dict(sel.sub)
         except Exception as e:  # noqa: BLE001
             log("error", cid, repr(e))
             bits = ALL
@@ -588,7 +639,31 @@ def main():
                 i += 1
             if nums:
                 nums += unknown
-        plan = {"cid": cid, "nums": nums, "run": None, "gamble": False}
+        plan = {"cid": cid, "nums": nums, "run": None, "gamble": False, "split": None}
+        if can_run and local_ok and sub and nums and not unknown:
+            # slow tests made of independent queries: run only the queries the edit reaches
+            subset, drop = {}, []
+            for cn, tid in maps.index.get("split", {}).items():
+                n = num_of.get(tid)
+                if n is None or n not in nums:
+                    continue
+                v = sub.get(cn)
+                if v is None or v == "*":
+                    continue
+                ks = [k for k in range(v.bit_length()) if v >> k & 1]
+                subset[tid] = ks
+                drop.append(n)
+            if subset:
+                ucpu = maps.index.get("unit_cpu", {})
+                est = setup["class"].get("tests/test_executor.py::TestExecutor", 3000) + setup["base"]
+                for tid, ks in subset.items():
+                    d = ucpu.get(tid, {})
+                    tot = sum(d.values()) or 1.0
+                    est += sum(ms[num_of[tid]] * d.get(str(k), tot / max(len(d), 1)) / tot for k in ks)
+                rest = [n for n in nums if n not in drop]
+                saving = cost_ms(nums, ms) - cost_ms(rest, ms)
+                if est < SPLIT_SHARE * saving:
+                    plan.update(split=subset, rest=rest, edits=edits)
         if can_run and local_ok and nums and not unknown:
             light = [n for n in nums if runnable(n)]
             heavy = [n for n in nums if not runnable(n)]
@@ -603,7 +678,7 @@ def main():
                     plan.update(run=light, heavy=[], edits=edits)
         plans.append(plan)
 
-    todo = [p for p in plans if p["run"]]
+    todo = [p for p in plans if p["run"] or p["split"]]
     # exclude classes whose set-up alone is costly
     for p in todo if False else []:
         pass
@@ -614,6 +689,14 @@ def main():
             if time.time() - t0 > WALL_BUDGET:
                 return p, None
             root = os.path.join("/tmp", "o", p["cid"])
+            if p["split"]:
+                try:
+                    local.make_overlay(root, p["edits"])
+                    res = local.run_tests(root, list(p["split"]), timeout=60, failfast=True, subset=p["split"])
+                except Exception as e:  # noqa: BLE001
+                    log("local error", p["cid"], repr(e))
+                    res = None
+                return p, res
             try:
                 local.make_overlay(root, p["edits"])
                 spend = sum(ms[n] for n in p["run"])
@@ -628,9 +711,18 @@ def main():
             for p, res in ex.map(go, todo):
                 if res is None:
                     continue
+                if p["split"]:
+                    if not res:
+                        log("split-pass", p["cid"], {t: len(k) for t, k in p["split"].items()})
+                        p["nums"] = p["rest"]
+                    else:
+                        log("split-fail", p["cid"])
+                    continue
                 failed = [n for n in p["run"] if id_of[n] in res]
                 if not failed:
                     # every test that runs the edit passes here: nothing to run
+                    if p["gamble"]:
+                        log("skipped-slow", p["cid"], " ".join(id_of[n] for n in p["heavy"]))
                     p["nums"] = []
                 log(p["cid"], "ran", len(p["run"]), "failed", len(failed), "est", est_cpu(p["run"]))
 

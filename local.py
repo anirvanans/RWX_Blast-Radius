@@ -53,7 +53,7 @@ def make_overlay(root, files):
     return root
 
 
-def run_tests(root, ids, timeout, failfast=False):
+def run_tests(root, ids, timeout, failfast=False, subset=None):
     """Run test ids in the patched tree. Returns a set of failing ids, or None if unsure."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -62,7 +62,10 @@ def run_tests(root, ids, timeout, failfast=False):
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
     }
-    args = [sys.executable, "-E", RUNNER] + (["--failfast"] if failfast else []) + list(ids)
+    args = [sys.executable, "-E", RUNNER] + (["--failfast"] if failfast else [])
+    if subset:
+        args += ["--subset", json.dumps(subset)]
+    args += list(ids)
     p = subprocess.Popen(args, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         out, _ = p.communicate(timeout=timeout)

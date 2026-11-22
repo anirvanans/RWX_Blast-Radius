@@ -50,10 +50,34 @@ concurrent.futures.ProcessPoolExecutor = InlineExecutor
 concurrent.futures.process.ProcessPoolExecutor = InlineExecutor
 
 
+LISTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds_sqls",
+}
+
+
+def restrict(module, subset):
+    """Keep only the given queries of the TPC executor tests."""
+    klass = module.TestExecutor
+    orig = klass.setUpClass.__func__
+
+    def setUpClass(cls):
+        orig(cls)
+        for tid, attr in LISTS.items():
+            if tid in subset:
+                full = getattr(cls, attr)
+                setattr(cls, attr, [full[k] for k in subset[tid] if k < len(full)])
+
+    klass.setUpClass = classmethod(setUpClass)
+
+
 def main(ids):
     failfast = False
+    subset = None
     if ids and ids[0] == "--failfast":
         failfast, ids = True, ids[1:]
+    if ids and ids[0] == "--subset":
+        subset, ids = json.loads(ids[1]), ids[2:]
     failing = set()
     by_module = {}
     for tid in ids:
@@ -69,6 +93,8 @@ def main(ids):
         except BaseException:  # noqa: BLE001
             failing.update(t for _, _, t in items)
             continue
+        if subset and mod == "tests.test_executor":
+            restrict(m, subset)
         for cls, meth, tid in items:
             try:
                 case = getattr(m, cls)(meth)

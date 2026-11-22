@@ -38,6 +38,7 @@ for t in tests:
 def ctx_tests(ctx):
     """Bitset of tests a coverage/recording context stands for, and its kind."""
     kind, _, rest = ctx.partition("|")
+    rest = rest.split("#", 1)[0]
     if kind == "call":
         n = NUM.get(rest)
         return (1 << n if n is not None else 0), "test"
@@ -91,6 +92,8 @@ for p in files:
         "nlines": src.count("\n") + 1,
         "ast": hashlib.sha1(ast.dump(tree).encode()).hexdigest(),
         "strings": S.string_ranges(tree),
+        "docs": S.doc_ranges(tree),
+        "astnd": hashlib.sha1(ast.dump(S.strip_docstrings(ast.parse(src))).encode()).hexdigest(),
         "istmts": S.inner_statements(tree),
         "exec": exec_lines(src, p),
     }
@@ -109,6 +112,29 @@ def innermost_index(p):
 
 
 inner = {p: innermost_index(p) for p in files}
+SPLIT = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+}
+SPLIT_NUM = {NUM[t]: t for t in SPLIT if t in NUM}
+subl = {p: defaultdict(lambda: defaultdict(set)) for p in files}  # line -> test -> units ("*" = all)
+
+
+def split_units(ctx):
+    """[(test number, unit or "*")] that a context stands for among the split tests."""
+    kind, _, rest = ctx.partition("|")
+    out = []
+    if kind == "call":
+        nodeid, _, k = rest.partition("#")
+        n = NUM.get(nodeid)
+        if n in SPLIT_NUM:
+            out.append((n, int(k) if k else "*"))
+        return out
+    bits, _ = ctx_tests(ctx)
+    for n in SPLIT_NUM:
+        if bits >> n & 1:
+            out.append((n, "*"))
+    return out
 line_bits = {p: defaultdict(int) for p in files}
 func_bits = {p: [0] * len(info[p]["spans"]) for p in files}
 file_bits = defaultdict(int)  # any line executed during a test phase
@@ -117,10 +143,15 @@ dial_bits = defaultdict(int)  # dialect classes from this module used by a test
 fix_bits = defaultdict(int)
 cls_bits = defaultdict(int)  # "module:Qual.Name" -> tests that used that class or a subclass
 
+SPLIT_PREFIX = os.environ.get("SPLIT_PREFIX")
 for prefix in PREFIXES:
     data = coverage.CoverageData(prefix + ".coverage")
     data.read()
     ctx_cache = {}
+    if SPLIT_PREFIX and prefix != SPLIT_PREFIX:
+        # split tests are taken only from the run that recorded their units
+        for t in SPLIT:
+            ctx_cache["call|" + t] = (0, "other")
     for f in data.measured_files():
         p = rel(f)
         if p not in info:
@@ -134,6 +165,8 @@ for prefix in PREFIXES:
                 bits, kind = ctx_cache[c]
                 if not bits:
                     continue
+                for n, k in split_units(c):
+                    subl[p][ln][n].add(k)
                 if kind == "test":
                     file_bits[p] |= bits
                     if fi >= 0:
@@ -214,6 +247,12 @@ while changed:
         if b != dial_bits.get(q, 0):
             dial_bits[q] = b
             changed = True
+
+unit_cpu_all = {}
+for prefix in PREFIXES:
+    rec = json.load(open(prefix + ".json"))
+    for t, d in rec.get("unit_cpu", {}).items():
+        unit_cpu_all[t] = d
 
 # test modules imported by other test files (static), and test files themselves
 test_mod_importers = defaultdict(int)
@@ -408,8 +447,14 @@ for p in files:
         "ast": info[p]["ast"],
         "funcs": [[s, e, q, hx(func_bits[p][i])] for i, (s, e, q, _, _) in enumerate(sp)],
         "stmts": [list(x) for x in info[p]["stmts"]],
+        "docs": info[p]["docs"],
+        "astnd": info[p]["astnd"],
         "istmts": istmts_of(p),
         "family": is_family(p),
+        "subl": {
+            str(ln): {str(n): ("*" if "*" in ks else format(sum(1 << k for k in ks), "x")) for n, ks in d.items()}
+            for ln, d in subl[p].items()
+        },
         "cls": {k.split(":", 1)[1]: hx(b) for k, b in cls_bits.items() if k.split(":", 1)[0] == module_name(p)},
         "file": hx(file_bits.get(p, 0)),
         "imp": hx(imp_bits.get(p, 0)),
@@ -458,6 +503,8 @@ with open(os.path.join(OUT, "index.json"), "w") as f:
             "fixdir": {q: hx(b) for q, b in fix_dirs.items()},
             "fixtures": fixtures,
             "testfile": {p: hx(b) for p, b in BY_FILE.items()},
+            "split": {str(n): t for n, t in SPLIT_NUM.items()},
+            "unit_cpu": unit_cpu_all,
         },
         f,
         separators=(",", ":"),
